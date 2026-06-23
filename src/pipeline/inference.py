@@ -7,6 +7,17 @@ import subprocess
 import numpy as np
 from ultralytics import YOLO
 
+def point_in_zone(point, polygon_points):
+    """Runtime check: is a tracked vehicle's reference point inside/on a
+    calibrated zone?
+    point: (x, y) - e.g. the bottom-center of a vehicle's bounding box
+    polygon_points: list of (x, y) from calibration.json -> zones[name]
+    """
+    if not polygon_points or len(polygon_points) < 3:
+        return False
+    poly = np.array(polygon_points, dtype=np.int32)
+    return cv2.pointPolygonTest(poly, point, False) >= 0
+
 class DetectedLight:
     def __init__(self, bbox, confidence, state):
         self.bbox = bbox # [x1, y1, x2, y2]
@@ -18,24 +29,24 @@ class VehicleTracker:
         self.max_age = max_age
         self.traffic_direction = traffic_direction
         self.next_id = 1
-        # tracks map: id -> { "bbox": [x1, y1, x2, y2], "type": str, "age": int, "crossed": bool, "crossed_on_red": bool, "crossed_legally": bool }
         self.tracks = {}
 
-    def update(self, current_dets, intersection_state, x_min, y_min, x_max, y_max, w, h):
-        """
-        current_dets: list of dicts with {"type": str, "bbox": [x1, y1, x2, y2], "confidence": float}
-        Returns list of active tracks with violation status
-        """
-        # Filter detections to keep only vehicle classes
+    def update(self, current_dets, intersection_state, x_min, y_min, x_max, y_max, w, h, calibration=None):
         vehicle_types = ["car", "bus", "truck", "motorcycle", "vehicle"]
         current_vehicles = [d for d in current_dets if d["type"] in vehicle_types]
         
         matched_det_indices = set()
         matched_track_ids = set()
-        
         updated_tracks = {}
+
+        has_calib = calibration is not None and "zones" in calibration
+        stop_line_pts = calibration["zones"].get("stop_line", []) if has_calib else []
+        exit_line_pts = calibration["zones"].get("exit_line", []) if has_calib else []
         
-        # Try to match existing tracks with new detections using IoU
+        use_poly_stop = len(stop_line_pts) >= 3
+        use_poly_exit = len(exit_line_pts) >= 3
+
+        # Match existing tracks
         for track_id, track in self.tracks.items():
             best_iou = 0
             best_det_idx = -1
@@ -49,99 +60,127 @@ class VehicleTracker:
                     best_det_idx = idx
             
             if best_iou >= 0.20 and best_det_idx != -1:
-                # Matched!
                 det = current_vehicles[best_det_idx]
                 matched_det_indices.add(best_det_idx)
                 matched_track_ids.add(track_id)
                 
-                # Check crossing logic
                 x1, y1, x2, y2 = det["bbox"]
                 center_x = (x1 + x2) // 2
+                ref_pt = (center_x, y2)
                 
-                if self.traffic_direction == "away":
-                    line_y = y_max
-                    was_behind = track["bbox"][3] > line_y
-                    is_past = (y2 <= line_y) and (x_min <= center_x <= x_max)
+                if use_poly_stop:
+                    in_stop_line = point_in_zone(ref_pt, stop_line_pts)
                 else:
-                    line_y = y_min
-                    was_behind = track["bbox"][3] < line_y
-                    is_past = (y2 >= line_y) and (x_min <= center_x <= x_max)
+                    line_y = y_max if self.traffic_direction == "away" else y_min
+                    in_stop_line = (y2 <= line_y if self.traffic_direction == "away" else y2 >= line_y) and (x_min <= center_x <= x_max)
                 
-                crossed_on_red = track.get("crossed_on_red", False)
+                if use_poly_exit:
+                    in_exit_line = point_in_zone(ref_pt, exit_line_pts)
+                else:
+                    in_exit_line = False
+                
+                crossed_stop_line = track.get("crossed_stop_line", False)
+                crossed_exit_line = track.get("crossed_exit_line", False)
                 crossed_legally = track.get("crossed_legally", False)
-                
-                # Exact moment of crossing
-                if not track["crossed"] and is_past:
+                stop_line_violation = track.get("stop_line_violation", False)
+                red_light_violation = track.get("red_light_violation", False)
+
+                if in_stop_line and not crossed_stop_line:
+                    crossed_stop_line = True
                     if intersection_state == "red":
-                        crossed_on_red = True
+                        if not crossed_legally:
+                            if use_poly_exit:
+                                stop_line_violation = True
+                            else:
+                                red_light_violation = True
                     else:
                         crossed_legally = True
-                
-                # If first frame detection is already past the line, mark as crossed legally to be safe
-                if not track["crossed"] and not is_past:
-                    # Stays behind
-                    pass
-                elif not track["crossed"] and is_past and not was_behind:
-                    # We didn't see it behind the line (first frame detection past the line)
-                    crossed_legally = True
-                
-                # If it already crossed legally, make sure it cannot be flagged as crossed_on_red
+
+                if in_exit_line and not crossed_exit_line:
+                    crossed_exit_line = True
+                    if intersection_state == "red":
+                        if not crossed_legally:
+                            red_light_violation = True
+                            stop_line_violation = False
+                    else:
+                        crossed_legally = True
+
                 if crossed_legally:
-                    crossed_on_red = False
-                
+                    stop_line_violation = False
+                    red_light_violation = False
+
                 updated_tracks[track_id] = {
                     "bbox": det["bbox"],
                     "type": det["type"],
                     "age": 0,
-                    "crossed": track["crossed"] or is_past,
-                    "crossed_on_red": crossed_on_red,
-                    "crossed_legally": crossed_legally
+                    "crossed_stop_line": crossed_stop_line,
+                    "crossed_exit_line": crossed_exit_line,
+                    "crossed_legally": crossed_legally,
+                    "stop_line_violation": stop_line_violation,
+                    "red_light_violation": red_light_violation
                 }
             else:
-                # Not matched, increment age
                 track["age"] += 1
                 if track["age"] <= self.max_age:
                     updated_tracks[track_id] = track
         
-        # Create new tracks for unmatched detections
+        # New tracks
         for idx, det in enumerate(current_vehicles):
             if idx in matched_det_indices:
                 continue
             
-            # Check if starting past or behind the line
             x1, y1, x2, y2 = det["bbox"]
             center_x = (x1 + x2) // 2
-            if self.traffic_direction == "away":
-                line_y = y_max
-                is_past = (y2 <= line_y) and (x_min <= center_x <= x_max)
+            ref_pt = (center_x, y2)
+            
+            if use_poly_stop:
+                in_stop_line = point_in_zone(ref_pt, stop_line_pts)
             else:
-                line_y = y_min
-                is_past = (y2 >= line_y) and (x_min <= center_x <= x_max)
+                line_y = y_max if self.traffic_direction == "away" else y_min
+                in_stop_line = (y2 <= line_y if self.traffic_direction == "away" else y2 >= line_y) and (x_min <= center_x <= x_max)
             
-            # If new detection starts past the line, mark crossed_legally to avoid false violations
-            crossed_legally = is_past
+            if use_poly_exit:
+                in_exit_line = point_in_zone(ref_pt, exit_line_pts)
+            else:
+                in_exit_line = False
+                
+            crossed_legally = in_stop_line or in_exit_line
             
+            stop_line_violation = False
+            red_light_violation = False
+            
+            if in_stop_line and not crossed_legally and intersection_state == "red":
+                if use_poly_exit:
+                    stop_line_violation = True
+                else:
+                    red_light_violation = True
+                    
+            if in_exit_line and not crossed_legally and intersection_state == "red":
+                red_light_violation = True
+                
             updated_tracks[self.next_id] = {
                 "bbox": det["bbox"],
                 "type": det["type"],
                 "age": 0,
-                "crossed": is_past,
-                "crossed_on_red": False if crossed_legally else (intersection_state == "red" and is_past),
-                "crossed_legally": crossed_legally
+                "crossed_stop_line": in_stop_line,
+                "crossed_exit_line": in_exit_line,
+                "crossed_legally": crossed_legally,
+                "stop_line_violation": stop_line_violation,
+                "red_light_violation": red_light_violation
             }
             self.next_id += 1
             
         self.tracks = updated_tracks
         
-        # Build return results for currently active tracks
         results = []
         for track_id, track in self.tracks.items():
-            if track["age"] == 0: # only return active in this frame
+            if track["age"] == 0:
                 results.append({
                     "track_id": track_id,
                     "type": track["type"],
                     "bbox": track["bbox"],
-                    "crossed_on_red": track["crossed_on_red"]
+                    "stop_line_violation": track["stop_line_violation"],
+                    "red_light_violation": track["red_light_violation"]
                 })
         return results
 
@@ -216,6 +255,24 @@ class TrafficViolationPipeline:
         self.vehicle_classes = [2, 3, 5, 7]
         self.motorcycle_class = 3
         self.person_class = 0
+        
+        self.calibration = None
+        self.load_calibration()
+
+    def load_calibration(self, path="calibration.json"):
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    self.calibration = json.load(f)
+                if "zones" not in self.calibration:
+                    self.calibration = None
+                else:
+                    print(f"[+] Loaded calibration.json from {path}")
+            except Exception as e:
+                print(f"[-] Failed to load calibration: {e}")
+                self.calibration = None
+        else:
+            self.calibration = None
 
     @staticmethod
     def auto_detect_stop_line(image: np.ndarray):
@@ -434,7 +491,8 @@ class TrafficViolationPipeline:
             print(f"[-] detect_zebra_crossing_box failed: {e}")
             return [0, int(h * 0.60), w, int(h * 0.80)]
 
-    def process_image(self, image_path, output_dir="data/processed", tracker=None, custom_line=None, traffic_direction="towards"):
+    def process_image(self, image_path, output_dir="data/processed", tracker=None, custom_line=None, traffic_direction="towards", use_calibration=True):
+        self.load_calibration()
         os.makedirs(output_dir, exist_ok=True)
         from PIL import Image
         import numpy as np
@@ -460,13 +518,41 @@ class TrafficViolationPipeline:
         detections = []
         violations = []
         
+        has_calib = use_calibration and self.calibration is not None and "zones" in self.calibration
+        signal_roi_pts = self.calibration["zones"].get("signal_roi", []) if has_calib else []
+        use_signal_roi = len(signal_roi_pts) >= 2
+        
+        roi_offset_x = 0
+        roi_offset_y = 0
+        
+        if use_signal_roi:
+            pts = np.array(signal_roi_pts, dtype=np.int32)
+            roi_x, roi_y, roi_w, roi_h = cv2.boundingRect(pts)
+            pad = 15
+            roi_x1 = max(0, roi_x - pad)
+            roi_y1 = max(0, roi_y - pad)
+            roi_x2 = min(w, roi_x + roi_w + pad)
+            roi_y2 = min(h, roi_y + roi_h + pad)
+            
+            tl_img = img[roi_y1:roi_y2, roi_x1:roi_x2]
+            roi_offset_x = roi_x1
+            roi_offset_y = roi_y1
+            print(f"[*] signal_roi calibration active. Running traffic light model on crop: [{roi_x1}, {roi_y1}, {roi_x2}, {roi_y2}]")
+        else:
+            tl_img = img
+        
         try:
-            tl_preds = self.traffic_light_model(img, verbose=False)[0]
+            tl_preds = self.traffic_light_model(tl_img, verbose=False)[0]
             for box in tl_preds.boxes:
                 cls_id = int(box.cls[0])
                 cls_name = self.traffic_light_model.names.get(cls_id, "unknown").lower()
                 conf = float(box.conf[0])
-                tx1, ty1, tx2, ty2 = map(int, box.xyxy[0].tolist())
+                tx1_crop, ty1_crop, tx2_crop, ty2_crop = map(int, box.xyxy[0].tolist())
+                
+                tx1 = tx1_crop + roi_offset_x
+                ty1 = ty1_crop + roi_offset_y
+                tx2 = tx2_crop + roi_offset_x
+                ty2 = ty2_crop + roi_offset_y
 
                 # Map class names/IDs to color states
                 color_detected = "unknown"
@@ -562,7 +648,8 @@ class TrafficViolationPipeline:
             for cls_id, conf, xyxy in filtered_boxes:
                 label = global_results.names[cls_id].lower()
                 temp_dets.append({"type": label, "bbox": xyxy.tolist()})
-            tracker_results = tracker.update(temp_dets, intersection_state, x_min, y_min, x_max, y_max, w, h)
+            tracker_calibration = self.calibration if use_calibration else None
+            tracker_results = tracker.update(temp_dets, intersection_state, x_min, y_min, x_max, y_max, w, h, calibration=tracker_calibration)
             for tr in tracker_results:
                 tracked_vehicles[tuple(tr["bbox"])] = tr
         
@@ -632,33 +719,77 @@ class TrafficViolationPipeline:
                 is_red_light_violation = False
                 
                 # Check for Red Light Violation
+                is_stop_line_violation = False
                 tr_info = tracked_vehicles.get(tuple(xyxy.tolist())) if tracker is not None else None
                 if tracker is not None:
-                    if tr_info and tr_info["crossed_on_red"]:
-                        is_red_light_violation = True
-                        is_moto_violation = True
-                        moto_violations.append("RED LIGHT VIOLATION")
-                        violations.append({
-                            "type": "Red Light Violation",
-                            "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                            "details": f"Motorcycle (Track ID: {tr_info['track_id']}) crossed stop line during RED signal"
-                        })
-                else:
-                    if intersection_state == "red":
-                        moto_center_x = (x1 + x2) // 2
-                        if traffic_direction == "away":
-                            crossed = (y2 <= y_max) and (x_min <= moto_center_x <= x_max)
-                        else:
-                            crossed = (y2 >= y_min) and (x_min <= moto_center_x <= x_max)
-                            
-                        if crossed:
+                    if tr_info:
+                        if tr_info["red_light_violation"]:
                             is_red_light_violation = True
                             is_moto_violation = True
                             moto_violations.append("RED LIGHT VIOLATION")
                             violations.append({
                                 "type": "Red Light Violation",
                                 "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                                "details": f"Motorcycle crossed stop zone during RED signal"
+                                "details": f"Motorcycle (Track ID: {tr_info['track_id']}) crossed exit line during RED signal"
+                            })
+                        elif tr_info["stop_line_violation"]:
+                            is_moto_violation = True
+                            moto_violations.append("STOP LINE VIOLATION")
+                            violations.append({
+                                "type": "Stop Line Violation",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Motorcycle (Track ID: {tr_info['track_id']}) crossed stop line during RED signal"
+                            })
+                else:
+                    if intersection_state == "red":
+                        moto_center_x = (x1 + x2) // 2
+                        ref_pt = (moto_center_x, y2)
+                        
+                        has_calib = use_calibration and self.calibration is not None and "zones" in self.calibration
+                        stop_line_pts = self.calibration["zones"].get("stop_line", []) if has_calib else []
+                        exit_line_pts = self.calibration["zones"].get("exit_line", []) if has_calib else []
+                        
+                        use_poly_stop = len(stop_line_pts) >= 3
+                        use_poly_exit = len(exit_line_pts) >= 3
+                        
+                        if use_poly_stop:
+                            in_stop_line = point_in_zone(ref_pt, stop_line_pts)
+                        else:
+                            line_y = y_max if traffic_direction == "away" else y_min
+                            in_stop_line = (y2 <= line_y if traffic_direction == "away" else y2 >= line_y) and (x_min <= moto_center_x <= x_max)
+                            
+                        if use_poly_exit:
+                            in_exit_line = point_in_zone(ref_pt, exit_line_pts)
+                        else:
+                            in_exit_line = False
+                            
+                        is_stop_line_viol = False
+                        is_red_light_viol = False
+                        
+                        if in_exit_line:
+                            is_red_light_viol = True
+                        elif in_stop_line:
+                            if use_poly_exit:
+                                is_stop_line_viol = True
+                            else:
+                                is_red_light_viol = True
+                                
+                        if is_red_light_viol:
+                            is_red_light_violation = True
+                            is_moto_violation = True
+                            moto_violations.append("RED LIGHT VIOLATION")
+                            violations.append({
+                                "type": "Red Light Violation",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Motorcycle crossed exit line zone during RED signal"
+                            })
+                        elif is_stop_line_viol:
+                            is_moto_violation = True
+                            moto_violations.append("STOP LINE VIOLATION")
+                            violations.append({
+                                "type": "Stop Line Violation",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Motorcycle crossed stop line zone during RED signal"
                             })
                 
                 if no_helmet_count > 0:
@@ -766,29 +897,71 @@ class TrafficViolationPipeline:
                     
                 # Check for Red Light Violation
                 is_red_light_violation = False
+                is_stop_line_violation = False
                 tr_info = tracked_vehicles.get(tuple(xyxy.tolist())) if tracker is not None else None
                 if tracker is not None:
-                    if tr_info and tr_info["crossed_on_red"]:
-                        is_red_light_violation = True
-                        violations.append({
-                            "type": "Red Light Violation",
-                            "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                            "details": f"Vehicle (Track ID: {tr_info['track_id']}) crossed stop line during RED signal"
-                        })
-                else:
-                    if intersection_state == "red":
-                        veh_center_x = (x1 + x2) // 2
-                        if traffic_direction == "away":
-                            crossed = (y2 <= y_max) and (x_min <= veh_center_x <= x_max)
-                        else:
-                            crossed = (y2 >= y_min) and (x_min <= veh_center_x <= x_max)
-                            
-                        if crossed:
+                    if tr_info:
+                        if tr_info["red_light_violation"]:
                             is_red_light_violation = True
                             violations.append({
                                 "type": "Red Light Violation",
                                 "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                                "details": f"Vehicle crossed stop zone during RED signal"
+                                "details": f"Vehicle (Track ID: {tr_info['track_id']}) crossed exit line during RED signal"
+                            })
+                        elif tr_info["stop_line_violation"]:
+                            is_stop_line_violation = True
+                            violations.append({
+                                "type": "Stop Line Violation",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Vehicle (Track ID: {tr_info['track_id']}) crossed stop line during RED signal"
+                            })
+                else:
+                    if intersection_state == "red":
+                        veh_center_x = (x1 + x2) // 2
+                        ref_pt = (veh_center_x, y2)
+                        
+                        has_calib = use_calibration and self.calibration is not None and "zones" in self.calibration
+                        stop_line_pts = self.calibration["zones"].get("stop_line", []) if has_calib else []
+                        exit_line_pts = self.calibration["zones"].get("exit_line", []) if has_calib else []
+                        
+                        use_poly_stop = len(stop_line_pts) >= 3
+                        use_poly_exit = len(exit_line_pts) >= 3
+                        
+                        if use_poly_stop:
+                            in_stop_line = point_in_zone(ref_pt, stop_line_pts)
+                        else:
+                            line_y = y_max if traffic_direction == "away" else y_min
+                            in_stop_line = (y2 <= line_y if traffic_direction == "away" else y2 >= line_y) and (x_min <= veh_center_x <= x_max)
+                            
+                        if use_poly_exit:
+                            in_exit_line = point_in_zone(ref_pt, exit_line_pts)
+                        else:
+                            in_exit_line = False
+                            
+                        is_stop_line_viol = False
+                        is_red_light_viol = False
+                        
+                        if in_exit_line:
+                            is_red_light_viol = True
+                        elif in_stop_line:
+                            if use_poly_exit:
+                                is_stop_line_viol = True
+                            else:
+                                is_red_light_viol = True
+                                
+                        if is_red_light_viol:
+                            is_red_light_violation = True
+                            violations.append({
+                                "type": "Red Light Violation",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Vehicle crossed exit line zone during RED signal"
+                            })
+                        elif is_stop_line_viol:
+                            is_stop_line_violation = True
+                            violations.append({
+                                "type": "Stop Line Violation",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Vehicle crossed stop line zone during RED signal"
                             })
                 
                 veh_label = global_results.names[cls_id].upper()
@@ -796,6 +969,9 @@ class TrafficViolationPipeline:
                 if is_red_light_violation:
                     color = (0, 0, 255) # Override to Red
                     label_str = f"{veh_label}{track_id_str} + RED LIGHT VIOLATION"
+                elif is_stop_line_violation:
+                    color = (0, 165, 255) # Override to Orange
+                    label_str = f"{veh_label}{track_id_str} + STOP LINE VIOLATION"
                 else:
                     color = COLOR_MAP.get(veh_label, COLOR_MAP["UNKNOWN_VEHICLE"])
                     label_str = f"{veh_label}{track_id_str} ({conf*100:.1f}%)"
@@ -943,7 +1119,7 @@ class TrafficViolationPipeline:
                         cv2.putText(img, f"PLATE: {clean_text}", (xmin + 2, min(h - 3, ymax - 4)),
                                     cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, color, text_thickness)
 
-        # Draw the translucent stop zone overlay
+        # Draw the translucent zones
         line_color = (128, 128, 128) # Default gray
         if intersection_state == "red":
             line_color = (0, 0, 255)
@@ -951,16 +1127,49 @@ class TrafficViolationPipeline:
             line_color = (0, 255, 255)
         elif intersection_state == "green":
             line_color = (0, 255, 0)
-
-        # Create overlay copy for translucency
+            
+        has_calib = use_calibration and self.calibration is not None and "zones" in self.calibration
+        stop_line_pts = self.calibration["zones"].get("stop_line", []) if has_calib else []
+        exit_line_pts = self.calibration["zones"].get("exit_line", []) if has_calib else []
+        signal_roi_pts = self.calibration["zones"].get("signal_roi", []) if has_calib else []
+        
         overlay = img.copy()
-        cv2.rectangle(overlay, (x_min, y_min), (x_max, y_max), line_color, -1)
+        
+        # 1. Draw Stop Line
+        if len(stop_line_pts) >= 3:
+            pts = np.array(stop_line_pts, dtype=np.int32)
+            cv2.fillPoly(overlay, [pts], line_color)
+            cv2.polylines(img, [pts], isClosed=True, color=line_color, thickness=max(2, box_thickness))
+            cx, cy = stop_line_pts[0]
+            cv2.putText(img, "STOP LINE ZONE", (cx + 15, cy - 8 if cy > 20 else cy + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, line_color, text_thickness)
+        else:
+            # Fallback to rectangular stop zone
+            cv2.rectangle(overlay, (x_min, y_min), (x_max, y_max), line_color, -1)
+            cv2.rectangle(img, (x_min, y_min), (x_max, y_max), line_color, max(2, box_thickness))
+            cv2.putText(img, "STOP ZONE / ZEBRA CROSSING", (x_min + 15, y_min - 8 if y_min > 20 else y_min + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, line_color, text_thickness)
+            
+        # 2. Draw Exit Line
+        if len(exit_line_pts) >= 3:
+            pts = np.array(exit_line_pts, dtype=np.int32)
+            exit_color = (0, 165, 255) if intersection_state == "red" else line_color
+            cv2.fillPoly(overlay, [pts], exit_color)
+            cv2.polylines(img, [pts], isClosed=True, color=exit_color, thickness=max(2, box_thickness))
+            cx, cy = exit_line_pts[0]
+            cv2.putText(img, "EXIT ZONE", (cx + 15, cy - 8 if cy > 20 else cy + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, exit_color, text_thickness)
+            
+        # Apply translucency
         cv2.addWeighted(overlay, 0.25, img, 0.75, 0, img)
         
-        # Draw solid bounding outline and label
-        cv2.rectangle(img, (x_min, y_min), (x_max, y_max), line_color, max(2, box_thickness))
-        cv2.putText(img, "STOP ZONE / ZEBRA CROSSING", (x_min + 15, y_min - 8 if y_min > 20 else y_min + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, line_color, text_thickness)
+        # 3. Draw Signal ROI (outline only)
+        if len(signal_roi_pts) >= 2:
+            pts = np.array(signal_roi_pts, dtype=np.int32)
+            cv2.polylines(img, [pts], isClosed=len(signal_roi_pts) >= 3, color=(0, 255, 0), thickness=1)
+            cx, cy = signal_roi_pts[0]
+            cv2.putText(img, "SIGNAL ROI", (cx, cy - 5 if cy > 10 else cy + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.8, (0, 255, 0), 1)
 
         # Draw traffic signal status overlay in the top-left corner
         overlay_text = f"SIGNAL: {intersection_state.upper()}"
@@ -1015,7 +1224,7 @@ class TrafficViolationPipeline:
 
         return metadata
 
-    def process_video(self, video_path, output_dir="data/processed", custom_line=None, traffic_direction="towards"):
+    def process_video(self, video_path, output_dir="data/processed", custom_line=None, traffic_direction="towards", use_calibration=True):
         """
         Process a video frame-by-frame, applying tracking and yielding progress.
         """
@@ -1056,7 +1265,7 @@ class TrafficViolationPipeline:
             temp_frame_path = os.path.join(output_dir, f"temp_frame_{base_name}.jpg")
             cv2.imwrite(temp_frame_path, frame)
             
-            meta = self.process_image(temp_frame_path, output_dir=output_dir, tracker=tracker, custom_line=custom_line, traffic_direction=traffic_direction)
+            meta = self.process_image(temp_frame_path, output_dir=output_dir, tracker=tracker, custom_line=custom_line, traffic_direction=traffic_direction, use_calibration=use_calibration)
             
             processed_frame = cv2.imread(meta["processed_image"])
             out.write(processed_frame)
