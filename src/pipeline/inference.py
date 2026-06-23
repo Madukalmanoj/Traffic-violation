@@ -330,7 +330,7 @@ class TrafficViolationPipeline:
         self.plate_model = YOLO(plate_path)
 
         # Load custom Traffic Light Detector
-        traffic_light_path = os.path.join(weights_dir, "traffic_light_yolov8.pt")
+        traffic_light_path = os.path.join(weights_dir, "traffic_light_detector.pt")
         print(f"[*] Loading Traffic Light Model from {traffic_light_path}...")
         self.traffic_light_model = YOLO(traffic_light_path)
         
