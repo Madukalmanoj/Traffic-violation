@@ -1592,7 +1592,7 @@ with gr.Blocks() as demo:
             with gr.Column(scale=1):
                 # Normal image output preview group (visible by default)
                 with gr.Group(elem_id="image-preview-group") as image_preview_group:
-                    image_output = gr.Image(type="numpy", label="Annotated Evidence Output / Calibration Preview", interactive=False)
+                    image_output = gr.Image(type="numpy", label="Annotated Evidence Output / Calibration Preview", interactive=False, show_label=False)
                     signal_status_output = gr.Textbox(label="Detected Signal State", interactive=False)
                 
                 # Image Calibrator Canvas group (hidden by default, always in DOM)
@@ -1630,7 +1630,7 @@ with gr.Blocks() as demo:
             with gr.Column(scale=1):
                 # Normal video output preview group (visible by default)
                 with gr.Group(elem_id="video-preview-group") as video_preview_group:
-                    live_frame_output = gr.Image(label="Live Feed / Calibration Line Preview", type="numpy", interactive=False)
+                    live_frame_output = gr.Image(label="Live Feed / Calibration Line Preview", type="numpy", interactive=False, show_label=False)
                     video_output = gr.Video(label="Final Processed Video (H.264 Playback)", visible=False)
                     video_log_output = gr.Textbox(label="Processing Log / Status", lines=6, max_lines=8, interactive=False)
 
