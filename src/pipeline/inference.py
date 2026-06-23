@@ -197,20 +197,51 @@ except ImportError:
     READER = None
     print("[!] EasyOCR not installed. OCR text extraction will be bypassed (mock plate returned).")
 
-# Color Map (BGR format) for drawing annotations
-COLOR_MAP = {
-    "CAR": (255, 255, 0),        # Cyan (Blue + Green)
-    "BUS": (0, 128, 255),        # Orange (Green + Red)
-    "TRUCK": (255, 0, 128),      # Violet/Purple
-    "PERSON": (255, 0, 255),     # Magenta (Blue + Red)
-    "MOTORCYCLE_SAFE": (0, 255, 255), # Yellow (Green + Red)
-    "MOTORCYCLE_VIOLATION": (0, 0, 255), # Red
-    "HELMET_SAFE": (0, 255, 0),  # Green
-    "HELMET_VIOLATION": (0, 0, 255), # Red
-    "PLATE": (255, 100, 100),    # Bright Light Blue
-    "TRIPLE_RIDING": (255, 0, 255), # Magenta
-    "UNKNOWN_VEHICLE": (200, 200, 200) # Gray
-}
+def draw_custom_annotation(img, x1, y1, x2, y2, color, label_str):
+    h, w = img.shape[:2]
+    # 1. Bounding Box Style: Fill Style (15% opacity)
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, 0.15, img, 0.85, 0, img)
+    
+    # Border Thickness: 1 pixel
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
+    
+    # 2. Dynamic Label Scaling
+    box_w = x2 - x1
+    box_h = y2 - y1
+    max_edge = max(box_w, box_h)
+    if max_edge < 80:
+        font_scale = 0.16
+    elif max_edge < 150:
+        font_scale = 0.18
+    else:
+        font_scale = 0.22
+        
+    # 3. Label Background Box & Standard/Overflow Placement
+    (label_width, label_height), baseline = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+    
+    # Top Edge Overflow Prevention: y1 < 70px
+    if y1 < 70:
+        bg_y1 = y1
+        bg_y2 = y1 + label_height + baseline + 6
+        text_y = y1 + label_height + 2
+    else:
+        bg_y1 = y1 - label_height - baseline - 6
+        bg_y2 = y1
+        text_y = y1 - baseline - 2
+        
+    # Clamp coordinates to image boundaries
+    bg_x1 = max(0, x1)
+    bg_x2 = min(w, x1 + label_width + 6)
+    bg_y1 = max(0, bg_y1)
+    bg_y2 = min(h, bg_y2)
+    
+    # Draw background box (solid color matching category color)
+    cv2.rectangle(img, (bg_x1, bg_y1), (bg_x2, bg_y2), color, -1)
+    
+    # Draw text (Pure White)
+    cv2.putText(img, label_str, (x1 + 3, int(text_y)), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
 def compute_iou(box1, box2):
     x1_1, y1_1, x2_1, y2_1 = box1
@@ -708,14 +739,10 @@ class TrafficViolationPipeline:
                     
                     rider_head_boxes.append((global_hx1, global_hy1, global_hx2, global_hy2))
                     
-                    # Draw head bounding boxes and labels (very thin/delicate)
-                    color = COLOR_MAP["HELMET_VIOLATION"] if is_violation else COLOR_MAP["HELMET_SAFE"]
-                    cv2.rectangle(img, (global_hx1, global_hy1), (global_hx2, global_hy2), color, box_thickness)
-                    
-                    # Draw text label ONLY for violations to avoid visual noise
-                    if is_violation:
-                        cv2.putText(img, "NO HELMET", (global_hx1, max(10, global_hy1 - 3)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, color, text_thickness)
+                    # Draw head bounding boxes and labels using custom styled annotations
+                    color = (0, 0, 255) if is_violation else (180, 50, 180) # Red or Purple BGR
+                    label_text = f"NO_HELMET {h_conf*100:.0f}%" if is_violation else f"HELMET {h_conf*100:.0f}%"
+                    draw_custom_annotation(img, global_hx1, global_hy1, global_hx2, global_hy2, color, label_text)
                 
                 # Determine motorcycle label, color, and flag violations (drawn ONCE to avoid thickness overlap)
                 moto_violations = []
@@ -830,23 +857,27 @@ class TrafficViolationPipeline:
                     })
                     
                     # Draw collective triple riding box around heads
-                    tr_color = COLOR_MAP["TRIPLE_RIDING"]
-                    cv2.rectangle(img, (rx1, ry1), (rx2, ry2), tr_color, box_thickness)
-                    cv2.putText(img, f"TRIPLE RIDING: {riders_count} RIDERS", (rx1, max(10, ry1 - 3)),
-                                cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, tr_color, text_thickness)
+                    tr_color = (180, 105, 255) # Hot Pink BGR
+                    draw_custom_annotation(img, rx1, ry1, rx2, ry2, tr_color, f"TRIPLE_RIDING {conf*100:.0f}%")
                 
-                color = COLOR_MAP["MOTORCYCLE_VIOLATION"] if is_moto_violation else COLOR_MAP["MOTORCYCLE_SAFE"]
-                cv2.rectangle(img, (x1, y1), (x2, y2), color, box_thickness)
-                
-                track_id_str = f" (ID: {tr_info['track_id']})" if (tracker is not None and tr_info) else ""
-                if moto_violations:
-                    label_str = f"MOTORCYCLE{track_id_str}: {' + '.join(moto_violations)}"
+                # Determine motorcycle color and label based on violation severity hierarchy
+                if is_red_light_violation:
+                    color = (0, 0, 200) # Deep Red
+                    label_str = f"RED_LIGHT_VIOLATION {conf*100:.0f}%"
+                elif is_stop_line_violation:
+                    color = (0, 255, 255) # Yellow
+                    label_str = f"STOP_LINE_VIOLATION {conf*100:.0f}%"
+                elif no_helmet_count > 0:
+                    color = (0, 0, 255) # Red
+                    label_str = f"NO_HELMET {conf*100:.0f}%"
+                elif riders_count > 2:
+                    color = (180, 105, 255) # Hot Pink
+                    label_str = f"TRIPLE_RIDING {conf*100:.0f}%"
                 else:
-                    label_str = f"MOTORCYCLE{track_id_str} ({conf*100:.1f}%)"
+                    color = (0, 200, 0) # Green (Compliant)
+                    label_str = f"MOTORCYCLE {conf*100:.0f}%"
                     
-                # Write label at the bottom-left inside the box to avoid top overlap
-                cv2.putText(img, label_str, (x1 + 3, min(h - 3, y2 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, text_thickness)
+                draw_custom_annotation(img, x1, y1, x2, y2, color, label_str)
             
             # 2. Handle Other Vehicles (License Plate & OCR Checks)
             elif cls_id in self.vehicle_classes:
@@ -889,10 +920,9 @@ class TrafficViolationPipeline:
                         plate_text = "KA03MH1234" # Mock fallback
                     
                     # Annotate License Plate
-                    color = COLOR_MAP["PLATE"]
-                    cv2.rectangle(img, (global_px1, global_py1), (global_px2, global_py2), color, box_thickness)
-                    cv2.putText(img, f"PLATE: {plate_text}", (global_px1 + 2, min(h - 3, global_py2 - 4)),
-                                cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, color, text_thickness)
+                    color = (255, 165, 0) # Light Blue / Amber
+                    label_text = f"PLATE: {plate_text} {p_conf*100:.0f}%"
+                    draw_custom_annotation(img, global_px1, global_py1, global_px2, global_py2, color, label_text)
                     
                     detections.append({
                         "type": "license_plate",
@@ -975,18 +1005,16 @@ class TrafficViolationPipeline:
                 veh_label = global_results.names[cls_id].upper()
                 track_id_str = f" (ID: {tr_info['track_id']})" if (tracker is not None and tr_info) else ""
                 if is_red_light_violation:
-                    color = (0, 0, 255) # Override to Red
-                    label_str = f"{veh_label}{track_id_str} + RED LIGHT VIOLATION"
+                    color = (0, 0, 200) # Deep Red
+                    label_str = f"RED_LIGHT_VIOLATION {conf*100:.0f}%"
                 elif is_stop_line_violation:
-                    color = (0, 165, 255) # Override to Orange
-                    label_str = f"{veh_label}{track_id_str} + STOP LINE VIOLATION"
+                    color = (0, 255, 255) # Yellow
+                    label_str = f"STOP_LINE_VIOLATION {conf*100:.0f}%"
                 else:
-                    color = COLOR_MAP.get(veh_label, COLOR_MAP["UNKNOWN_VEHICLE"])
-                    label_str = f"{veh_label}{track_id_str} ({conf*100:.1f}%)"
+                    color = (0, 200, 0) # Green (Compliant)
+                    label_str = f"{veh_label} {conf*100:.0f}%"
                     
-                cv2.rectangle(img, (x1, y1), (x2, y2), color, box_thickness)
-                cv2.putText(img, label_str, (x1 + 3, min(h - 3, y2 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, text_thickness)
+                draw_custom_annotation(img, x1, y1, x2, y2, color, label_str)
 
         # Step 3: Close-up / Fallback checks
         has_motorcycle = any(d["type"] in ["motorcycle", "motorcycle_safe", "motorcycle_violation"] for d in detections)
@@ -1018,18 +1046,15 @@ class TrafficViolationPipeline:
                 
                 # Check for violation
                 is_violation = ("without" in cls_name.lower() or "no" in cls_name.lower() or h_cls == 1)
-                color = COLOR_MAP["HELMET_VIOLATION"] if is_violation else COLOR_MAP["HELMET_SAFE"]
-                label_text = "NO HELMET" if is_violation else f"HELMET ({h_conf*100:.1f}%)"
+                color = (0, 0, 255) if is_violation else (180, 50, 180) # Red or Purple BGR
+                label_text = f"NO_HELMET {h_conf*100:.0f}%" if is_violation else f"HELMET {h_conf*100:.0f}%"
                 if is_violation:
                     violations.append({
                         "type": "Helmet Non-Compliance",
                         "bbox": [int(hx1), int(hy1), int(hx2), int(hy2)],
                         "details": "Rider without helmet detected in close-up"
                     })
-                cv2.rectangle(img, (hx1, hy1), (hx2, hy2), color, box_thickness)
-                if is_violation:
-                    cv2.putText(img, label_text, (hx1, max(10, hy1 - 3)),
-                                cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, color, text_thickness)
+                draw_custom_annotation(img, hx1, hy1, hx2, hy2, color, label_text)
 
             # Draw Triple Riding box if more than 2 riders are detected on the full image
             if riders_count > 2 and len(rider_head_boxes) > 0:
@@ -1049,10 +1074,8 @@ class TrafficViolationPipeline:
                     "confidence": 0.90
                 })
                 
-                tr_color = COLOR_MAP["TRIPLE_RIDING"]
-                cv2.rectangle(img, (rx1, ry1), (rx2, ry2), tr_color, box_thickness)
-                cv2.putText(img, f"TRIPLE RIDING: {riders_count} RIDERS", (rx1, max(10, ry1 - 3)),
-                            cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, tr_color, text_thickness)
+                tr_color = (180, 105, 255) # Hot Pink BGR
+                draw_custom_annotation(img, rx1, ry1, rx2, ry2, tr_color, "TRIPLE_RIDING 90%")
 
         # Fallback 2: Run License Plate sub-detector on full image if no plate was detected
         if not has_plate:
@@ -1084,10 +1107,9 @@ class TrafficViolationPipeline:
                     "confidence": p_conf
                 })
                 
-                color = COLOR_MAP["PLATE"]
-                cv2.rectangle(img, (px1, py1), (px2, py2), color, box_thickness)
-                cv2.putText(img, f"PLATE: {plate_text}", (px1 + 2, min(h - 3, py2 - 4)),
-                            cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, color, text_thickness)
+                color = (255, 165, 0) # Light Blue / Amber BGR
+                label_text = f"PLATE: {plate_text} {p_conf*100:.0f}%"
+                draw_custom_annotation(img, px1, py1, px2, py2, color, label_text)
 
             # Direct OCR Fallback if still no plate detections
             has_plate_updated = any(d["type"] == "license_plate" for d in detections)
@@ -1122,10 +1144,9 @@ class TrafficViolationPipeline:
                             "confidence": float(conf)
                         })
                         
-                        color = COLOR_MAP["PLATE"]
-                        cv2.rectangle(img, (xmin, ymin), (xmax, ymax), color, box_thickness)
-                        cv2.putText(img, f"PLATE: {clean_text}", (xmin + 2, min(h - 3, ymax - 4)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, color, text_thickness)
+                        color = (255, 165, 0) # Light Blue / Amber BGR
+                        label_text = f"PLATE: {clean_text} {conf*100:.0f}%"
+                        draw_custom_annotation(img, xmin, ymin, xmax, ymax, color, label_text)
 
         # Draw the translucent zones
         line_color = (128, 128, 128) # Default gray
