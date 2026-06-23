@@ -750,8 +750,10 @@ class TrafficViolationPipeline:
                 rider_head_boxes = []
                 
                 for h_box in helmet_results.boxes:
-                    h_cls = int(h_box.cls[0]) # Custom classes typically: 0: helmet, 1: no-helmet
                     h_conf = float(h_box.conf[0])
+                    if h_conf < 0.45:
+                        continue
+                    h_cls = int(h_box.cls[0]) # Custom classes typically: 0: helmet, 1: no-helmet
                     
                     # Track riders (both helmet & no_helmet represent a rider)
                     riders_count += 1
@@ -1203,8 +1205,10 @@ class TrafficViolationPipeline:
             riders_count = 0
             
             for h_box in helmet_results.boxes:
-                h_cls = int(h_box.cls[0])
                 h_conf = float(h_box.conf[0])
+                if h_conf < 0.65:
+                    continue
+                h_cls = int(h_box.cls[0])
                 h_xyxy = h_box.xyxy[0].cpu().numpy().astype(int)
                 hx1, hy1, hx2, hy2 = h_xyxy
                 
