@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import numpy as np
 from ultralytics import YOLO
+from .preprocessor import ImagePreprocessor
 
 def point_in_zone(point, polygon_points):
     """Runtime check: is a tracked vehicle's reference point inside/on a
@@ -299,6 +300,7 @@ class TrafficViolationPipeline:
         
         self.calibration = None
         self.load_calibration()
+        self.preprocessor = ImagePreprocessor()
 
     def load_calibration(self, path="calibration.json"):
         if os.path.exists(path):
@@ -542,6 +544,10 @@ class TrafficViolationPipeline:
             img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         except Exception as e:
             raise ValueError(f"Could not read image {image_path}. Error: {e}")
+            
+        # Run image through preprocessor
+        img, q_metrics = self.preprocessor.enhance(img)
+        print(f"[*] Preprocessor Quality Score: {q_metrics['overall_score']:.2f} (Bypass: {q_metrics['bypass']})")
             
         h, w, _ = img.shape
         print(f"[*] Processing image: {image_path} ({w}x{h})")
