@@ -673,6 +673,18 @@ class TrafficViolationPipeline:
         # Step 1: Run Global Bounding Box Detection
         global_results = self.global_model(img, verbose=False)[0]
         
+        # Extract persons and cell phones from the global model results
+        persons = []
+        cell_phones = []
+        for box in global_results.boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            xyxy = box.xyxy[0].cpu().numpy().astype(int)
+            if cls_id == 0 and conf >= 0.25: # person
+                persons.append({"conf": conf, "bbox": xyxy})
+            elif cls_id == 67 and conf >= 0.25: # cell phone
+                cell_phones.append({"conf": conf, "bbox": xyxy})
+        
         # Pre-filter vehicle detections with IoU-based NMS to remove overlapping/duplicate boxes
         raw_boxes = []
         for box in global_results.boxes:
@@ -765,6 +777,17 @@ class TrafficViolationPipeline:
                     color = (0, 0, 255) if is_violation else (180, 50, 180) # Red or Purple BGR
                     label_text = f"NO_HELMET {h_conf*100:.0f}%" if is_violation else f"HELMET {h_conf*100:.0f}%"
                     draw_custom_annotation(img, global_hx1, global_hy1, global_hx2, global_hy2, color, label_text)
+                
+                # Also count riders using global person detections overlapping with this motorcycle
+                overlapping_persons = 0
+                for p in persons:
+                    px1, py1, px2, py2 = p["bbox"]
+                    p_center_x = (px1 + px2) // 2
+                    p_bottom_y = py2
+                    if compute_iou(p["bbox"], [x1, y1, x2, y2]) > 0.01 or (x1 - int((x2-x1)*0.15) <= p_center_x <= x2 + int((x2-x1)*0.15) and y1 - int((y2-y1)*0.35) <= p_bottom_y <= y2 + 10):
+                        overlapping_persons += 1
+                
+                riders_count = max(riders_count, overlapping_persons)
                 
                 # Determine motorcycle label, color, and flag violations (drawn ONCE to avoid thickness overlap)
                 moto_violations = []
@@ -866,11 +889,15 @@ class TrafficViolationPipeline:
                     is_moto_violation = True
                     moto_violations.append(f"TRIPLE RIDING ({riders_count})")
                     
-                    # Compute collective triple riding bounding box around all detected rider heads
-                    rx1 = min([b[0] for b in rider_head_boxes])
-                    ry1 = min([b[1] for b in rider_head_boxes])
-                    rx2 = max([b[2] for b in rider_head_boxes])
-                    ry2 = max([b[3] for b in rider_head_boxes])
+                    # Compute collective triple riding bounding box around all detected rider heads or overlapping persons
+                    boxes_to_use = rider_head_boxes if len(rider_head_boxes) > 0 else [p["bbox"] for p in persons if (compute_iou(p["bbox"], [x1, y1, x2, y2]) > 0.01 or (x1 - int((x2-x1)*0.15) <= (p["bbox"][0] + p["bbox"][2]) // 2 <= x2 + int((x2-x1)*0.15) and y1 - int((y2-y1)*0.35) <= p["bbox"][3] <= y2 + 10))]
+                    if len(boxes_to_use) > 0:
+                        rx1 = min([b[0] for b in boxes_to_use])
+                        ry1 = min([b[1] for b in boxes_to_use])
+                        rx2 = max([b[2] for b in boxes_to_use])
+                        ry2 = max([b[3] for b in boxes_to_use])
+                    else:
+                        rx1, ry1, rx2, ry2 = x1, y1, x2, y2
                     
                     # Add to violations and detections
                     violations.append({
@@ -1045,23 +1072,13 @@ class TrafficViolationPipeline:
                 draw_custom_annotation(img, x1, y1, x2, y2, color, label_str)
 
         # Step 2.5: Process Person, Mobile Phone, and Seatbelt detections
-        # Extract persons and cell phones from the global model results
-        persons = []
-        cell_phones = []
-        for box in global_results.boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            xyxy = box.xyxy[0].cpu().numpy().astype(int)
-            if cls_id == 0 and conf >= 0.25: # person
-                persons.append({"conf": conf, "bbox": xyxy})
-            elif cls_id == 67 and conf >= 0.25: # cell phone
-                cell_phones.append({"conf": conf, "bbox": xyxy})
-                
-        # Find all vehicles from filtered_boxes
-        detected_vehicles = []
+        # Note: persons and cell_phones are already extracted at Step 1 to allow early riders_count checks.
+        
+        # Find all 4-wheel vehicles (car, bus, truck) from filtered_boxes for seatbelt checks
+        four_wheel_vehicles = []
         for cls_id, conf, xyxy in filtered_boxes:
-            if cls_id in self.vehicle_classes:
-                detected_vehicles.append(xyxy)
+            if cls_id in [2, 5, 7]: # Car, Bus, Truck (excluding 3: Motorcycle)
+                four_wheel_vehicles.append(xyxy)
                 
         # Loop through each person to check for seatbelt and mobile usage
         for p_idx, p in enumerate(persons):
@@ -1069,14 +1086,24 @@ class TrafficViolationPipeline:
             p_conf = p["conf"]
             p_center = ((px1 + px2) // 2, (py1 + py2) // 2)
             
-            # 1. Check if person is inside/overlapping with a vehicle (Car, Truck, Bus)
+            # Check if person is on a motorcycle (rider)
+            on_motorcycle = False
+            for cls_id, conf, v_bbox in filtered_boxes:
+                if cls_id == 3: # motorcycle
+                    vx1, vy1, vx2, vy2 = v_bbox
+                    if (vx1 <= p_center[0] <= vx2 and vy1 <= p_center[1] <= vy2) or compute_iou(p["bbox"], v_bbox) > 0.01:
+                        on_motorcycle = True
+                        break
+            
+            # 1. Check if person is inside/overlapping with a 4-wheel vehicle (Car, Truck, Bus)
             in_vehicle = False
-            for v_bbox in detected_vehicles:
-                vx1, vy1, vx2, vy2 = v_bbox
-                # If person center is inside vehicle bbox OR overlap IoU is > 0.05
-                if (vx1 <= p_center[0] <= vx2 and vy1 <= p_center[1] <= vy2) or compute_iou(p["bbox"], v_bbox) > 0.05:
-                    in_vehicle = True
-                    break
+            if not on_motorcycle:
+                for v_bbox in four_wheel_vehicles:
+                    vx1, vy1, vx2, vy2 = v_bbox
+                    # If person center is inside vehicle bbox OR overlap IoU is > 0.05
+                    if (vx1 <= p_center[0] <= vx2 and vy1 <= p_center[1] <= vy2) or compute_iou(p["bbox"], v_bbox) > 0.05:
+                        in_vehicle = True
+                        break
                     
             # 2. Check if using mobile phone
             uses_mobile = False
@@ -1121,12 +1148,14 @@ class TrafficViolationPipeline:
                     if not has_seatbelt_line:
                         has_seatbelt = False
                         
+            person_type = "Rider" if on_motorcycle else "Pedestrian"
+            
             # Annotate based on findings
             if uses_mobile:
                 violations.append({
                     "type": "Using Mobile",
                     "bbox": [int(px1), int(py1), int(px2), int(py2)],
-                    "details": f"Person using mobile phone (confidence: {phone_conf_val*100:.0f}%)"
+                    "details": f"{person_type} using mobile phone (confidence: {phone_conf_val*100:.0f}%)"
                 })
                 detections.append({
                     "type": "using_mobile",
@@ -1140,7 +1169,7 @@ class TrafficViolationPipeline:
                 violations.append({
                     "type": "No Seatbelt",
                     "bbox": [int(px1), int(py1), int(px2), int(py2)],
-                    "details": "Driver/Passenger detected without seatbelt"
+                    "details": f"{person_type} detected without seatbelt"
                 })
                 detections.append({
                     "type": "no_seatbelt",
@@ -1151,14 +1180,15 @@ class TrafficViolationPipeline:
                 draw_custom_annotation(img, px1, py1, px2, py2, (0, 128, 255), "NO_SEATBELT 85%")
                 
             else:
-                # Compliant person detection
+                # Compliant detection
+                label = "RIDER" if on_motorcycle else "PEDESTRIAN"
                 detections.append({
-                    "type": "person",
+                    "type": label.lower(),
                     "bbox": [int(px1), int(py1), int(px2), int(py2)],
                     "confidence": p_conf
                 })
-                # Green color BGR for COMPLIANT PERSON
-                draw_custom_annotation(img, px1, py1, px2, py2, (0, 200, 0), f"PERSON {p_conf*100:.0f}%")
+                # Green color BGR
+                draw_custom_annotation(img, px1, py1, px2, py2, (0, 200, 0), f"{label} {p_conf*100:.0f}%")
 
         # Step 3: Close-up / Fallback checks
         has_motorcycle = any(d["type"] in ["motorcycle", "motorcycle_safe", "motorcycle_violation"] for d in detections)
@@ -1354,13 +1384,20 @@ class TrafficViolationPipeline:
         elif intersection_state == "green":
             overlay_color = (0, 255, 0)
             
+        status_font_scale = max(0.35, font_scale * 0.95)
+        status_thickness = max(1, text_thickness)
+        
         # Draw a semi-transparent background block for the signal text
-        text_w, text_h = cv2.getTextSize(overlay_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale * 1.2, text_thickness * 2)[0]
-        cv2.rectangle(img, (10, 10), (15 + text_w + 30, 15 + text_h + 10), (30, 30, 30), -1)
+        text_w, text_h = cv2.getTextSize(overlay_text, cv2.FONT_HERSHEY_SIMPLEX, status_font_scale, status_thickness)[0]
+        # Background box: use translucent overlay
+        overlay = img.copy()
+        cv2.rectangle(overlay, (10, 10), (15 + text_w + 30, 15 + text_h + 10), (30, 30, 30), -1)
+        cv2.addWeighted(overlay, 0.4, img, 0.6, 0, img)
+        
         # Draw status circle
         cv2.circle(img, (25 + text_w + 10, 15 + text_h // 2 + 5), int(text_h * 0.6), overlay_color, -1)
         # Draw text
-        cv2.putText(img, overlay_text, (20, 15 + text_h + 3), cv2.FONT_HERSHEY_SIMPLEX, font_scale * 1.2, (255, 255, 255), text_thickness * 2)
+        cv2.putText(img, overlay_text, (20, 15 + text_h + 3), cv2.FONT_HERSHEY_SIMPLEX, status_font_scale, (255, 255, 255), status_thickness, lineType=cv2.LINE_AA)
 
         # Step 4: Write output image (always save as jpg for compatibility)
         base_name = os.path.splitext(os.path.basename(image_path))[0]
