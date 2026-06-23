@@ -1265,20 +1265,30 @@ class TrafficViolationPipeline:
             raise ValueError(f"Could not open video {video_path}")
             
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            total_frames = 300
         fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 30.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Calculate stride based on total frames (minimum 5, maximum 10)
+        stride = max(5, min(10, total_frames // 100))
+        print(f"[*] Calculated video processing stride: {stride} (Total frames: {total_frames})")
         
         base_name = os.path.splitext(os.path.basename(video_path))[0]
         temp_output_filename = f"temp_processed_{base_name}.mp4"
         temp_output_path = os.path.join(output_dir, temp_output_filename)
         
-        # Write to temporary mp4
+        # Write to temporary mp4 with adjusted output FPS
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(temp_output_path, fourcc, fps, (width, height))
+        out_fps = max(1.0, fps / stride)
+        out = cv2.VideoWriter(temp_output_path, fourcc, out_fps, (width, height))
         
-        # Initialize video tracker
-        tracker = VehicleTracker(max_age=10, traffic_direction=traffic_direction)
+        # Initialize video tracker with max_age scaled to the stride
+        tracker_max_age = max(10, stride * 2)
+        tracker = VehicleTracker(max_age=tracker_max_age, traffic_direction=traffic_direction)
         
         frame_idx = 0
         all_violations = []
@@ -1290,6 +1300,8 @@ class TrafficViolationPipeline:
                 break
                 
             frame_idx += 1
+            if (frame_idx - 1) % stride != 0:
+                continue
             
             temp_frame_path = os.path.join(output_dir, f"temp_frame_{base_name}.jpg")
             cv2.imwrite(temp_frame_path, frame)
