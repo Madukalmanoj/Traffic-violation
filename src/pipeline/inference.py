@@ -1203,10 +1203,11 @@ class TrafficViolationPipeline:
             helmet_results = self.helmet_model(img, verbose=False)[0]
             rider_head_boxes = []
             riders_count = 0
+            no_helmet_count = 0
             
             for h_box in helmet_results.boxes:
                 h_conf = float(h_box.conf[0])
-                if h_conf < 0.65:
+                if h_conf < 0.45:
                     continue
                 h_cls = int(h_box.cls[0])
                 h_xyxy = h_box.xyxy[0].cpu().numpy().astype(int)
@@ -1227,12 +1228,26 @@ class TrafficViolationPipeline:
                 color = (0, 0, 255) if is_violation else (180, 50, 180) # Red or Purple BGR
                 label_text = f"NO_HELMET {h_conf*100:.0f}%" if is_violation else f"HELMET {h_conf*100:.0f}%"
                 if is_violation:
+                    no_helmet_count += 1
                     violations.append({
                         "type": "Helmet Non-Compliance",
                         "bbox": [int(hx1), int(hy1), int(hx2), int(hy2)],
                         "details": "Rider without helmet detected in close-up"
                     })
                 draw_custom_annotation(img, hx1, hy1, hx2, hy2, color, label_text)
+
+            # If helmet model missed some riders, supplement count from global model persons
+            if len(persons) > riders_count:
+                riders_count = len(persons)
+                # Add any person bboxes not already covered by head boxes
+                for p in persons:
+                    px1, py1, px2, py2 = p["bbox"]
+                    p_head_box = (int(px1), int(py1), int((px1+px2)//2), int(py1 + (py2-py1)//3))
+                    already_covered = any(
+                        compute_iou(list(p_head_box), list(b)) > 0.1 for b in rider_head_boxes
+                    )
+                    if not already_covered:
+                        rider_head_boxes.append(p_head_box)
 
             # Draw Triple Riding box if more than 2 riders are detected on the full image
             if riders_count > 2 and len(rider_head_boxes) > 0:
@@ -1253,7 +1268,7 @@ class TrafficViolationPipeline:
                 })
                 
                 tr_color = (180, 105, 255) # Hot Pink BGR
-                draw_custom_annotation(img, rx1, ry1, rx2, ry2, tr_color, "TRIPLE_RIDING 90%")
+                draw_custom_annotation(img, rx1, ry1, rx2, ry2, tr_color, f"TRIPLE_RIDING ({riders_count} RIDERS)")
 
         # Fallback 2: Run License Plate sub-detector on full image if no plate was detected
         if not has_plate:
@@ -1378,7 +1393,7 @@ class TrafficViolationPipeline:
             cv2.putText(img, "SIGNAL ROI", (cx, cy - 5 if cy > 10 else cy + 15),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.8, (0, 255, 0), 1)
 
-        # Draw traffic signal status overlay in the top-left corner
+        # Draw traffic signal status overlay in the bottom-left corner (non-blocking)
         overlay_text = f"SIGNAL: {intersection_state.upper()}"
         overlay_color = (128, 128, 128)
         if intersection_state == "red":
@@ -1391,17 +1406,24 @@ class TrafficViolationPipeline:
         status_font_scale = max(0.35, font_scale * 0.95)
         status_thickness = max(1, text_thickness)
         
-        # Draw a semi-transparent background block for the signal text
+        # Draw a semi-transparent background block for the signal text at the bottom-left
         text_w, text_h = cv2.getTextSize(overlay_text, cv2.FONT_HERSHEY_SIMPLEX, status_font_scale, status_thickness)[0]
-        # Background box: use translucent overlay
+        # Place at bottom-left corner with padding
+        pad = 8
+        bx1 = 5
+        by2 = h - 5
+        bx2 = bx1 + text_w + pad * 2 + text_h + 10  # extra room for circle
+        by1 = by2 - text_h - pad * 2
         overlay = img.copy()
-        cv2.rectangle(overlay, (10, 10), (15 + text_w + 30, 15 + text_h + 10), (30, 30, 30), -1)
-        cv2.addWeighted(overlay, 0.4, img, 0.6, 0, img)
+        cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (30, 30, 30), -1)
+        cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
         
         # Draw status circle
-        cv2.circle(img, (25 + text_w + 10, 15 + text_h // 2 + 5), int(text_h * 0.6), overlay_color, -1)
+        circle_x = bx2 - text_h // 2 - pad
+        circle_y = (by1 + by2) // 2
+        cv2.circle(img, (circle_x, circle_y), int(text_h * 0.5), overlay_color, -1)
         # Draw text
-        cv2.putText(img, overlay_text, (20, 15 + text_h + 3), cv2.FONT_HERSHEY_SIMPLEX, status_font_scale, (255, 255, 255), status_thickness, lineType=cv2.LINE_AA)
+        cv2.putText(img, overlay_text, (bx1 + pad, by2 - pad), cv2.FONT_HERSHEY_SIMPLEX, status_font_scale, (255, 255, 255), status_thickness, lineType=cv2.LINE_AA)
 
         # Step 4: Write output image (always save as jpg for compatibility)
         base_name = os.path.splitext(os.path.basename(image_path))[0]
