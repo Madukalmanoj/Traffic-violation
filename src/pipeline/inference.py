@@ -1016,6 +1016,122 @@ class TrafficViolationPipeline:
                     
                 draw_custom_annotation(img, x1, y1, x2, y2, color, label_str)
 
+        # Step 2.5: Process Person, Mobile Phone, and Seatbelt detections
+        # Extract persons and cell phones from the global model results
+        persons = []
+        cell_phones = []
+        for box in global_results.boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            xyxy = box.xyxy[0].cpu().numpy().astype(int)
+            if cls_id == 0 and conf >= 0.25: # person
+                persons.append({"conf": conf, "bbox": xyxy})
+            elif cls_id == 67 and conf >= 0.25: # cell phone
+                cell_phones.append({"conf": conf, "bbox": xyxy})
+                
+        # Find all vehicles from filtered_boxes
+        detected_vehicles = []
+        for cls_id, conf, xyxy in filtered_boxes:
+            if cls_id in self.vehicle_classes:
+                detected_vehicles.append(xyxy)
+                
+        # Loop through each person to check for seatbelt and mobile usage
+        for p_idx, p in enumerate(persons):
+            px1, py1, px2, py2 = p["bbox"]
+            p_conf = p["conf"]
+            p_center = ((px1 + px2) // 2, (py1 + py2) // 2)
+            
+            # 1. Check if person is inside/overlapping with a vehicle (Car, Truck, Bus)
+            in_vehicle = False
+            for v_bbox in detected_vehicles:
+                vx1, vy1, vx2, vy2 = v_bbox
+                # If person center is inside vehicle bbox OR overlap IoU is > 0.05
+                if (vx1 <= p_center[0] <= vx2 and vy1 <= p_center[1] <= vy2) or compute_iou(p["bbox"], v_bbox) > 0.05:
+                    in_vehicle = True
+                    break
+                    
+            # 2. Check if using mobile phone
+            uses_mobile = False
+            phone_conf_val = 0.0
+            for phone in cell_phones:
+                ph_x1, ph_y1, ph_x2, ph_y2 = phone["bbox"]
+                ph_center = ((ph_x1 + ph_x2) // 2, (ph_y1 + ph_y2) // 2)
+                # If cell phone center is inside person bbox OR overlaps with person bbox
+                if (px1 <= ph_center[0] <= px2 and py1 <= ph_center[1] <= py2) or compute_iou(p["bbox"], phone["bbox"]) > 0.0:
+                    uses_mobile = True
+                    phone_conf_val = phone["conf"]
+                    break
+                    
+            # 3. Check seatbelt compliance using CV Hough heuristic (if in vehicle and large enough)
+            has_seatbelt = True
+            pw = px2 - px1
+            ph = py2 - py1
+            
+            if in_vehicle and pw >= 40 and ph >= 60:
+                cx1 = max(0, px1 + int(pw * 0.15))
+                cx2 = min(w, px2 - int(pw * 0.15))
+                cy1 = max(0, py1 + int(ph * 0.15))
+                cy2 = min(h, py1 + int(ph * 0.65))
+                
+                chest_crop = img[cy1:cy2, cx1:cx2]
+                if chest_crop.size > 0:
+                    gray = cv2.cvtColor(chest_crop, cv2.COLOR_BGR2GRAY)
+                    edges = cv2.Canny(gray, 50, 150)
+                    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20, minLineLength=15, maxLineGap=8)
+                    
+                    has_seatbelt_line = False
+                    if lines is not None:
+                        for line in lines:
+                            lx1, ly1, lx2, ly2 = line[0]
+                            dx = lx2 - lx1
+                            dy = ly2 - ly1
+                            if dx != 0:
+                                slope = abs(dy / dx)
+                                if 0.35 <= slope <= 2.5: # 20 to 68 degrees
+                                    has_seatbelt_line = True
+                                    break
+                    if not has_seatbelt_line:
+                        has_seatbelt = False
+                        
+            # Annotate based on findings
+            if uses_mobile:
+                violations.append({
+                    "type": "Using Mobile",
+                    "bbox": [int(px1), int(py1), int(px2), int(py2)],
+                    "details": f"Person using mobile phone (confidence: {phone_conf_val*100:.0f}%)"
+                })
+                detections.append({
+                    "type": "using_mobile",
+                    "bbox": [int(px1), int(py1), int(px2), int(py2)],
+                    "confidence": phone_conf_val
+                })
+                # Purple color BGR for USING_MOBILE
+                draw_custom_annotation(img, px1, py1, px2, py2, (211, 0, 148), f"USING_MOBILE {phone_conf_val*100:.0f}%")
+                
+            elif not has_seatbelt:
+                violations.append({
+                    "type": "No Seatbelt",
+                    "bbox": [int(px1), int(py1), int(px2), int(py2)],
+                    "details": "Driver/Passenger detected without seatbelt"
+                })
+                detections.append({
+                    "type": "no_seatbelt",
+                    "bbox": [int(px1), int(py1), int(px2), int(py2)],
+                    "confidence": 0.85
+                })
+                # Orange color BGR for NO_SEATBELT
+                draw_custom_annotation(img, px1, py1, px2, py2, (0, 128, 255), "NO_SEATBELT 85%")
+                
+            else:
+                # Compliant person detection
+                detections.append({
+                    "type": "person",
+                    "bbox": [int(px1), int(py1), int(px2), int(py2)],
+                    "confidence": p_conf
+                })
+                # Green color BGR for COMPLIANT PERSON
+                draw_custom_annotation(img, px1, py1, px2, py2, (0, 200, 0), f"PERSON {p_conf*100:.0f}%")
+
         # Step 3: Close-up / Fallback checks
         has_motorcycle = any(d["type"] in ["motorcycle", "motorcycle_safe", "motorcycle_violation"] for d in detections)
         has_plate = any(d["type"] == "license_plate" for d in detections)
