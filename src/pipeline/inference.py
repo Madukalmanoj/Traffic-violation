@@ -68,6 +68,7 @@ class VehicleTracker:
                 
                 x1, y1, x2, y2 = det["bbox"]
                 center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
                 ref_pt = (center_x, y2)
                 
                 if use_poly_stop:
@@ -110,6 +111,38 @@ class VehicleTracker:
                     stop_line_violation = False
                     red_light_violation = False
 
+                # Wrong-Side driving check
+                trajectory = track.get("trajectory", []) + [(center_x, center_y)]
+                trajectory = trajectory[-20:]
+                
+                wrong_side_violation = track.get("wrong_side_violation", False)
+                if len(trajectory) >= 5:
+                    fx, fy = trajectory[0]
+                    lx, ly = trajectory[-1]
+                    dy = ly - fy
+                    if self.traffic_direction == "towards":
+                        # Expect y to increase (moving towards). If y decreases significantly, it's wrong-way
+                        if dy < -30:
+                            wrong_side_violation = True
+                    elif self.traffic_direction == "away":
+                        # Expect y to decrease (moving away). If y increases significantly, it's wrong-way
+                        if dy > 30:
+                            wrong_side_violation = True
+
+                # Illegal parking check (stationary on roadway)
+                prev_cx, prev_cy = trajectory[-2] if len(trajectory) >= 2 else (center_x, center_y)
+                dist = np.hypot(center_x - prev_cx, center_y - prev_cy)
+                if dist < 2.5:
+                    idle_frames = track.get("idle_frames", 0) + 1
+                else:
+                    idle_frames = 0
+
+                illegal_parking_violation = track.get("illegal_parking_violation", False)
+                # 60 frames (~3 sec) stationary, and NOT legally stopped at red light
+                if idle_frames >= 60:
+                    if intersection_state != "red" and not in_stop_line:
+                        illegal_parking_violation = True
+
                 updated_tracks[track_id] = {
                     "bbox": det["bbox"],
                     "type": det["type"],
@@ -118,7 +151,12 @@ class VehicleTracker:
                     "crossed_exit_line": crossed_exit_line,
                     "crossed_legally": crossed_legally,
                     "stop_line_violation": stop_line_violation,
-                    "red_light_violation": red_light_violation
+                    "red_light_violation": red_light_violation,
+                    "trajectory": trajectory,
+                    "idle_frames": idle_frames,
+                    "wrong_side_violation": wrong_side_violation,
+                    "illegal_parking_violation": illegal_parking_violation,
+                    "track_id": track.get("track_id", track_id)
                 }
             else:
                 track["age"] += 1
@@ -132,6 +170,7 @@ class VehicleTracker:
             
             x1, y1, x2, y2 = det["bbox"]
             center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
             ref_pt = (center_x, y2)
             
             if use_poly_stop:
@@ -166,7 +205,12 @@ class VehicleTracker:
                 "crossed_exit_line": in_exit_line,
                 "crossed_legally": crossed_legally,
                 "stop_line_violation": stop_line_violation,
-                "red_light_violation": red_light_violation
+                "red_light_violation": red_light_violation,
+                "trajectory": [(center_x, center_y)],
+                "idle_frames": 0,
+                "wrong_side_violation": False,
+                "illegal_parking_violation": False,
+                "track_id": self.next_id
             }
             self.next_id += 1
             
@@ -176,11 +220,14 @@ class VehicleTracker:
         for track_id, track in self.tracks.items():
             if track["age"] == 0:
                 results.append({
-                    "track_id": track_id,
+                    "track_id": track.get("track_id", track_id),
                     "type": track["type"],
                     "bbox": track["bbox"],
                     "stop_line_violation": track["stop_line_violation"],
-                    "red_light_violation": track["red_light_violation"]
+                    "red_light_violation": track["red_light_violation"],
+                    "wrong_side_violation": track.get("wrong_side_violation", False),
+                    "illegal_parking_violation": track.get("illegal_parking_violation", False),
+                    "trajectory": track.get("trajectory", [])
                 })
         return results
 
@@ -283,13 +330,7 @@ class TrafficViolationPipeline:
         self.plate_model = YOLO(plate_path)
 
         # Load custom Traffic Light Detector
-        default_traffic_light_path = os.path.join(weights_dir, "traffic_light_yolov8.pt")
-        custom_traffic_light_path = r"D:\Hackathons\flipkartTraffic\models\traffic_light_detector.pt"
-        if os.path.exists(custom_traffic_light_path):
-            traffic_light_path = custom_traffic_light_path
-            print(f"[*] Custom traffic light model detected at {custom_traffic_light_path}. Using it for testing.")
-        else:
-            traffic_light_path = default_traffic_light_path
+        traffic_light_path = os.path.join(weights_dir, "traffic_light_yolov8.pt")
         print(f"[*] Loading Traffic Light Model from {traffic_light_path}...")
         self.traffic_light_model = YOLO(traffic_light_path)
         
@@ -840,6 +881,13 @@ class TrafficViolationPipeline:
                     
                     rider_head_boxes.append((global_hx1, global_hy1, global_hx2, global_hy2))
                     
+                    # Append detection to global list for evaluation
+                    detections.append({
+                        "type": "without_helmet" if is_violation else "with_helmet",
+                        "bbox": [int(global_hx1), int(global_hy1), int(global_hx2), int(global_hy2)],
+                        "confidence": h_conf
+                    })
+                    
                     # Draw head bounding boxes and labels using custom styled annotations
                     color = (0, 0, 255) if is_violation else (180, 50, 180) # Red or Purple BGR
                     label_text = f"NO_HELMET {h_conf*100:.0f}%" if is_violation else f"HELMET {h_conf*100:.0f}%"
@@ -883,6 +931,22 @@ class TrafficViolationPipeline:
                                 "type": "Stop Line Violation",
                                 "bbox": [int(x1), int(y1), int(x2), int(y2)],
                                 "details": f"Motorcycle (Track ID: {tr_info['track_id']}) crossed stop line during RED signal"
+                            })
+                        if tr_info.get("wrong_side_violation", False):
+                            is_moto_violation = True
+                            moto_violations.append("WRONG-SIDE DRIVING")
+                            violations.append({
+                                "type": "Wrong-Side Driving",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Motorcycle (Track ID: {tr_info['track_id']}) driving in wrong direction"
+                            })
+                        if tr_info.get("illegal_parking_violation", False):
+                            is_moto_violation = True
+                            moto_violations.append("ILLEGAL PARKING")
+                            violations.append({
+                                "type": "Illegal Parking",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Motorcycle (Track ID: {tr_info['track_id']}) parked illegally on active road"
                             })
                 else:
                     if intersection_state == "red" and len(tl_results) > 0:
@@ -979,22 +1043,44 @@ class TrafficViolationPipeline:
                     tr_color = (180, 105, 255) # Hot Pink BGR
                     draw_custom_annotation(img, rx1, ry1, rx2, ry2, tr_color, f"TRIPLE_RIDING {conf*100:.0f}%")
                 
+                is_wrong_side = tr_info.get("wrong_side_violation", False) if (tr_info and tracker is not None) else False
+                is_illegal_parking = tr_info.get("illegal_parking_violation", False) if (tr_info and tracker is not None) else False
+                
+                # Draw wrong-side trajectory arrow if violation occurs
+                if is_wrong_side and tr_info and "trajectory" in tr_info and len(tr_info["trajectory"]) > 1:
+                    traj = tr_info["trajectory"]
+                    for idx_t in range(1, len(traj)):
+                        pt1 = traj[idx_t - 1]
+                        pt2 = traj[idx_t]
+                        cv2.line(img, (int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1])), (0, 0, 255), 2)
+                    pt_last = traj[-1]
+                    pt_prev = traj[-2]
+                    cv2.arrowedLine(img, (int(pt_prev[0]), int(pt_prev[1])), (int(pt_last[0]), int(pt_last[1])), (0, 0, 255), 3, tipLength=0.3)
+
+                track_id_str = f" ID:{tr_info['track_id']}" if (tracker is not None and tr_info) else ""
+
                 # Determine motorcycle color and label based on violation severity hierarchy
                 if is_red_light_violation:
                     color = (0, 0, 200) # Deep Red
-                    label_str = f"RED_LIGHT_VIOLATION {conf*100:.0f}%"
+                    label_str = f"RED_LIGHT_VIOLATION{track_id_str} {conf*100:.0f}%"
+                elif is_wrong_side:
+                    color = (0, 0, 139) # Dark Red
+                    label_str = f"WRONG_SIDE{track_id_str} {conf*100:.0f}%"
                 elif is_stop_line_violation:
                     color = (0, 255, 255) # Yellow
-                    label_str = f"STOP_LINE_VIOLATION {conf*100:.0f}%"
+                    label_str = f"STOP_LINE_VIOLATION{track_id_str} {conf*100:.0f}%"
                 elif no_helmet_count > 0:
                     color = (0, 0, 255) # Red
-                    label_str = f"NO_HELMET {conf*100:.0f}%"
+                    label_str = f"NO_HELMET{track_id_str} {conf*100:.0f}%"
                 elif riders_count > 2:
                     color = (180, 105, 255) # Hot Pink
-                    label_str = f"TRIPLE_RIDING {conf*100:.0f}%"
+                    label_str = f"TRIPLE_RIDING{track_id_str} {conf*100:.0f}%"
+                elif is_illegal_parking:
+                    color = (0, 140, 255) # Dark Orange
+                    label_str = f"ILLEGAL_PARKING{track_id_str} {conf*100:.0f}%"
                 else:
                     color = (0, 200, 0) # Green (Compliant)
-                    label_str = f"MOTORCYCLE {conf*100:.0f}%"
+                    label_str = f"MOTORCYCLE{track_id_str} {conf*100:.0f}%"
                     
                 draw_custom_annotation(img, x1, y1, x2, y2, color, label_str)
             
@@ -1070,6 +1156,18 @@ class TrafficViolationPipeline:
                                 "bbox": [int(x1), int(y1), int(x2), int(y2)],
                                 "details": f"Vehicle (Track ID: {tr_info['track_id']}) crossed stop line during RED signal"
                             })
+                        if tr_info.get("wrong_side_violation", False):
+                            violations.append({
+                                "type": "Wrong-Side Driving",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Vehicle (Track ID: {tr_info['track_id']}) driving in wrong direction"
+                            })
+                        if tr_info.get("illegal_parking_violation", False):
+                            violations.append({
+                                "type": "Illegal Parking",
+                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                                "details": f"Vehicle (Track ID: {tr_info['track_id']}) parked illegally on active road"
+                            })
                 else:
                     if intersection_state == "red" and len(tl_results) > 0:
                         veh_center_x = (x1 + x2) // 2
@@ -1119,16 +1217,36 @@ class TrafficViolationPipeline:
                             })
                 
                 veh_label = global_results.names[cls_id].upper()
-                track_id_str = f" (ID: {tr_info['track_id']})" if (tracker is not None and tr_info) else ""
+                is_wrong_side = tr_info.get("wrong_side_violation", False) if (tr_info and tracker is not None) else False
+                is_illegal_parking = tr_info.get("illegal_parking_violation", False) if (tr_info and tracker is not None) else False
+
+                # Draw wrong-side trajectory arrow if violation occurs
+                if is_wrong_side and tr_info and "trajectory" in tr_info and len(tr_info["trajectory"]) > 1:
+                    traj = tr_info["trajectory"]
+                    for idx_t in range(1, len(traj)):
+                        pt1 = traj[idx_t - 1]
+                        pt2 = traj[idx_t]
+                        cv2.line(img, (int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1])), (0, 0, 255), 2)
+                    pt_last = traj[-1]
+                    pt_prev = traj[-2]
+                    cv2.arrowedLine(img, (int(pt_prev[0]), int(pt_prev[1])), (int(pt_last[0]), int(pt_last[1])), (0, 0, 255), 3, tipLength=0.3)
+
+                track_id_str = f" ID:{tr_info['track_id']}" if (tracker is not None and tr_info) else ""
                 if is_red_light_violation:
                     color = (0, 0, 200) # Deep Red
-                    label_str = f"RED_LIGHT_VIOLATION {conf*100:.0f}%"
+                    label_str = f"RED_LIGHT_VIOLATION{track_id_str} {conf*100:.0f}%"
+                elif is_wrong_side:
+                    color = (0, 0, 139) # Dark Red
+                    label_str = f"WRONG_SIDE{track_id_str} {conf*100:.0f}%"
                 elif is_stop_line_violation:
                     color = (0, 255, 255) # Yellow
-                    label_str = f"STOP_LINE_VIOLATION {conf*100:.0f}%"
+                    label_str = f"STOP_LINE_VIOLATION{track_id_str} {conf*100:.0f}%"
+                elif is_illegal_parking:
+                    color = (0, 140, 255) # Dark Orange
+                    label_str = f"ILLEGAL_PARKING{track_id_str} {conf*100:.0f}%"
                 else:
                     color = (0, 200, 0) # Green (Compliant)
-                    label_str = f"{veh_label} {conf*100:.0f}%"
+                    label_str = f"{veh_label}{track_id_str} {conf*100:.0f}%"
                     
                 draw_custom_annotation(img, x1, y1, x2, y2, color, label_str)
 

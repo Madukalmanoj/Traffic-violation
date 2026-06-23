@@ -24,7 +24,9 @@ def get_analytics():
             {"Violation Type": "No Seatbelt", "Count": 0},
             {"Violation Type": "Using Mobile", "Count": 0},
             {"Violation Type": "Red Light Violation", "Count": 0},
-            {"Violation Type": "Stop Line Violation", "Count": 0}
+            {"Violation Type": "Stop Line Violation", "Count": 0},
+            {"Violation Type": "Wrong-Side Driving", "Count": 0},
+            {"Violation Type": "Illegal Parking", "Count": 0}
         ])
         df_time = pd.DataFrame(columns=["Time", "Count"])
         metrics_html = """
@@ -49,7 +51,7 @@ def get_analytics():
     total_violations = len(df_history)
     
     type_counts = df_history["Violation Type"].value_counts().to_dict()
-    all_types = ["Helmet Non-Compliance", "Triple Riding", "No Seatbelt", "Using Mobile", "Red Light Violation", "Stop Line Violation"]
+    all_types = ["Helmet Non-Compliance", "Triple Riding", "No Seatbelt", "Using Mobile", "Red Light Violation", "Stop Line Violation", "Wrong-Side Driving", "Illegal Parking"]
     dist_data = []
     for t in all_types:
         dist_data.append({"Violation Type": t, "Count": type_counts.get(t, 0)})
