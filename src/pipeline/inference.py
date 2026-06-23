@@ -1281,15 +1281,15 @@ class TrafficViolationPipeline:
         overlay = img.copy()
         
         # 1. Draw Stop Line
-        if len(stop_line_pts) >= 3:
+        if len(stop_line_pts) >= 3 and intersection_state == "red":
             pts = np.array(stop_line_pts, dtype=np.int32)
             cv2.fillPoly(overlay, [pts], line_color)
             cv2.polylines(img, [pts], isClosed=True, color=line_color, thickness=max(2, box_thickness))
             cx, cy = stop_line_pts[0]
             cv2.putText(img, "STOP LINE ZONE", (cx + 15, cy - 8 if cy > 20 else cy + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, line_color, text_thickness)
-        elif not has_calib:
-            # Fallback to rectangular stop zone
+        elif not has_calib and intersection_state == "red":
+            # Fallback to rectangular stop zone (only active during red light)
             cv2.rectangle(overlay, (x_min, y_min), (x_max, y_max), line_color, -1)
             cv2.rectangle(img, (x_min, y_min), (x_max, y_max), line_color, max(2, box_thickness))
             cv2.putText(img, "STOP ZONE / ZEBRA CROSSING", (x_min + 15, y_min - 8 if y_min > 20 else y_min + 20),
