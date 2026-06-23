@@ -1467,7 +1467,7 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
         logs.append(f"[+] Output saved to: {final_res['processed_video']}")
         visible_logs = "\n".join(logs[-15:])
         
-        yield visible_logs, gr.update(value=final_res["processed_video"], visible=True), json.dumps(final_violations, indent=2), final_df, updated_global_df, gr.update(value=None, visible=False), gr.update()
+        yield visible_logs, gr.update(value=final_res["processed_video"], visible=True), json.dumps(final_violations, indent=2), final_df, updated_global_df, gr.update(value=None, visible=True), gr.update()
         
     except Exception as e:
         import traceback
@@ -1581,12 +1581,13 @@ with gr.Blocks() as demo:
                     helmet_model_dropdown = gr.Dropdown(
                         choices=["Custom flipkartTraffic (YOLOv8-Medium)", "jarvanlee (YOLOv8-Medium)"],
                         value="Custom flipkartTraffic (YOLOv8-Medium)",
-                        label="Helmet Detection Model"
+                        label="Helmet Detection Model",
+                        visible=False
                     )
-                    use_custom_line_image = gr.Checkbox(label="Use Custom Stop Zone Calibration", value=True)
-                    direction_image = gr.Radio(choices=["Towards Camera", "Away from Camera"], value="Towards Camera", label="Traffic Flow Direction")
+                    use_custom_line_image = gr.Checkbox(label="Use Custom Stop Zone Calibration", value=False)
+                    direction_image = gr.Radio(choices=["Towards Camera", "Away from Camera"], value="Towards Camera", label="Traffic Flow Direction", visible=False)
                 
-                setup_calib_img_btn = gr.Button("🔧 Setup Stop Line / Calibration", variant="secondary")
+                setup_calib_img_btn = gr.Button("🔧 Setup Stop Line / Calibration", variant="secondary", visible=False)
                 process_btn = gr.Button("🚀 Analyze Image", variant="primary")
             
             with gr.Column(scale=1):
@@ -1619,19 +1620,20 @@ with gr.Blocks() as demo:
                     video_helmet_dropdown = gr.Dropdown(
                         choices=["Custom flipkartTraffic (YOLOv8-Medium)", "jarvanlee (YOLOv8-Medium)"],
                         value="Custom flipkartTraffic (YOLOv8-Medium)",
-                        label="Helmet Detection Model"
+                        label="Helmet Detection Model",
+                        visible=False
                     )
-                    use_custom_line_video = gr.Checkbox(label="Use Custom Stop Zone Calibration", value=True)
-                    direction_video = gr.Radio(choices=["Towards Camera", "Away from Camera"], value="Away from Camera", label="Traffic Flow Direction")
+                    use_custom_line_video = gr.Checkbox(label="Use Custom Stop Zone Calibration", value=False)
+                    direction_video = gr.Radio(choices=["Towards Camera", "Away from Camera"], value="Away from Camera", label="Traffic Flow Direction", visible=False)
                 
-                setup_calib_vid_btn = gr.Button("🔧 Setup Stop Line / Calibration", variant="secondary")
+                setup_calib_vid_btn = gr.Button("🔧 Setup Stop Line / Calibration", variant="secondary", visible=False)
                 video_process_btn = gr.Button("🚀 Analyze Video", variant="primary")
                 
             with gr.Column(scale=1):
                 # Normal video output preview group (visible by default)
                 with gr.Group(elem_id="video-preview-group") as video_preview_group:
+                    video_output = gr.Video(label="✅ Processed Video (H.264 Playback)", visible=False, elem_id="processed-video-output")
                     live_frame_output = gr.Image(label="Live Feed / Calibration Line Preview", type="numpy", interactive=False, show_label=False)
-                    video_output = gr.Video(label="Final Processed Video (H.264 Playback)", visible=False)
                     video_log_output = gr.Textbox(label="Processing Log / Status", lines=6, max_lines=8, interactive=False)
 
                 # Video Calibrator Canvas group (hidden by default, always in DOM)
@@ -1674,6 +1676,11 @@ with gr.Blocks() as demo:
         inputs=[image_input, use_custom_line_image],
         outputs=image_output
     )
+    use_custom_line_image.change(
+        fn=lambda val: (gr.update(visible=val), gr.update(visible=val)),
+        inputs=[use_custom_line_image],
+        outputs=[direction_image, setup_calib_img_btn]
+    )
 
     # Bind preview updates for Video tab
     video_input.change(
@@ -1685,6 +1692,11 @@ with gr.Blocks() as demo:
         fn=update_video_preview,
         inputs=[video_input, use_custom_line_video],
         outputs=[live_frame_output, video_output]
+    )
+    use_custom_line_video.change(
+        fn=lambda val: (gr.update(visible=val), gr.update(visible=val)),
+        inputs=[use_custom_line_video],
+        outputs=[direction_video, setup_calib_vid_btn]
     )
 
     # Image Calibration trigger and save (uses client-side JS toggle)
