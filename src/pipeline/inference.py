@@ -70,9 +70,11 @@ class VehicleTracker:
                 
                 if use_poly_stop:
                     in_stop_line = point_in_zone(ref_pt, stop_line_pts)
-                else:
+                elif not has_calib:
                     line_y = y_max if self.traffic_direction == "away" else y_min
                     in_stop_line = (y2 <= line_y if self.traffic_direction == "away" else y2 >= line_y) and (x_min <= center_x <= x_max)
+                else:
+                    in_stop_line = False
                 
                 if use_poly_exit:
                     in_exit_line = point_in_zone(ref_pt, exit_line_pts)
@@ -135,9 +137,11 @@ class VehicleTracker:
             
             if use_poly_stop:
                 in_stop_line = point_in_zone(ref_pt, stop_line_pts)
-            else:
+            elif not has_calib:
                 line_y = y_max if self.traffic_direction == "away" else y_min
                 in_stop_line = (y2 <= line_y if self.traffic_direction == "away" else y2 >= line_y) and (x_min <= center_x <= x_max)
+            else:
+                in_stop_line = False
             
             if use_poly_exit:
                 in_exit_line = point_in_zone(ref_pt, exit_line_pts)
@@ -754,9 +758,11 @@ class TrafficViolationPipeline:
                         
                         if use_poly_stop:
                             in_stop_line = point_in_zone(ref_pt, stop_line_pts)
-                        else:
+                        elif not has_calib:
                             line_y = y_max if traffic_direction == "away" else y_min
                             in_stop_line = (y2 <= line_y if traffic_direction == "away" else y2 >= line_y) and (x_min <= moto_center_x <= x_max)
+                        else:
+                            in_stop_line = False
                             
                         if use_poly_exit:
                             in_exit_line = point_in_zone(ref_pt, exit_line_pts)
@@ -929,9 +935,11 @@ class TrafficViolationPipeline:
                         
                         if use_poly_stop:
                             in_stop_line = point_in_zone(ref_pt, stop_line_pts)
-                        else:
+                        elif not has_calib:
                             line_y = y_max if traffic_direction == "away" else y_min
                             in_stop_line = (y2 <= line_y if traffic_direction == "away" else y2 >= line_y) and (x_min <= veh_center_x <= x_max)
+                        else:
+                            in_stop_line = False
                             
                         if use_poly_exit:
                             in_exit_line = point_in_zone(ref_pt, exit_line_pts)
@@ -1143,7 +1151,7 @@ class TrafficViolationPipeline:
             cx, cy = stop_line_pts[0]
             cv2.putText(img, "STOP LINE ZONE", (cx + 15, cy - 8 if cy > 20 else cy + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, line_color, text_thickness)
-        else:
+        elif not has_calib:
             # Fallback to rectangular stop zone
             cv2.rectangle(overlay, (x_min, y_min), (x_max, y_max), line_color, -1)
             cv2.rectangle(img, (x_min, y_min), (x_max, y_max), line_color, max(2, box_thickness))

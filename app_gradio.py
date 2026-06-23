@@ -35,6 +35,8 @@ def load_session_calibration():
             print(f"[-] Error loading calibration for session: {e}")
     return default_zones
 
+CALIBRATION_ZONES = load_session_calibration()
+
 def save_calibration_data(w, h, zones_data):
     import json
     payload = {
@@ -81,9 +83,41 @@ def get_video_first_frame(video_path):
         print(f"[-] Error reading first video frame: {e}")
     return None
 
+def get_video_frame_at_time(video_path, timestamp_sec):
+    import cv2
+    try:
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 25.0
+        frame_idx = int(timestamp_sec * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            return frame
+    except Exception as e:
+        print(f"[-] Error reading frame at {timestamp_sec}s: {e}")
+    return None
+
+def get_video_duration(video_path):
+    if not video_path:
+        return 0.0
+    import cv2
+    try:
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.release()
+        if fps > 0 and frame_count > 0:
+            return frame_count / fps
+    except Exception as e:
+        print(f"[-] Error getting video duration: {e}")
+    return 0.0
 
 def get_base64_from_file(file_path):
     import base64
+    import os
     if not os.path.exists(file_path):
         return ""
     try:
@@ -101,7 +135,9 @@ def get_base64_from_numpy(img_array):
     import cv2
     import base64
     try:
-        _, buffer = cv2.imencode(".jpg", img_array)
+        # Convert RGB (from Gradio) to BGR for OpenCV encoding
+        bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        _, buffer = cv2.imencode(".jpg", bgr)
         encoded = base64.b64encode(buffer).decode("utf-8")
         return f"data:image/jpeg;base64,{encoded}"
     except Exception as e:
@@ -121,11 +157,24 @@ def save_calib_reference(img_array):
         print(f"[-] Error saving calibration reference: {e}")
         return False
 
-def load_initial_calib_base64():
+def get_base64_from_file(file_path):
+    import base64
     import os
-    if os.path.exists(CALIB_REF_PATH):
-        return get_base64_from_file(CALIB_REF_PATH)
-    return ""
+    if not os.path.exists(file_path):
+        return ""
+    try:
+        with open(file_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        ext = os.path.splitext(file_path)[1].lower().replace(".", "")
+        if ext == "jpg" or ext == "jpeg":
+            ext = "jpeg"
+        return f"data:image/{ext};base64,{encoded}"
+    except Exception as e:
+        print(f"[-] Error converting file to base64: {e}")
+        return ""
+
+def load_initial_calib_base64():
+    return get_base64_from_file(CALIB_REF_PATH)
 
 def load_initial_calib_json():
     import os
@@ -134,41 +183,88 @@ def load_initial_calib_json():
         try:
             with open("calibration.json", "r") as f:
                 data = json.load(f)
+            data["from_file"] = True
             return json.dumps(data)
         except Exception as e:
             print(f"[-] Error loading initial JSON calibration: {e}")
-    return json.dumps({"w": 1280, "h": 720, "zones": {"stop_line": [], "exit_line": [], "signal_roi": []}})
+    return json.dumps({"w": 1280, "h": 720, "zones": {"stop_line": [], "exit_line": [], "signal_roi": []}, "from_file": False})
 
-def handle_calib_image_upload(image):
+def toggle_image_calibration(image):
     if image is None:
-        return ""
-    save_calib_reference(image)
-    return get_base64_from_file(CALIB_REF_PATH)
+        return gr.update(visible=False), ""
+    try:
+        if isinstance(image, dict):
+            img_arr = image.get("composite", None) or image.get("background", None)
+        else:
+            img_arr = image
+        if img_arr is None:
+            return gr.update(visible=False), ""
+        save_calib_reference(img_arr)
+        b64_str = get_base64_from_file(CALIB_REF_PATH)
+        return gr.update(visible=True), b64_str
+    except Exception as e:
+        print(f"[-] toggle_image_calibration failed: {e}")
+        return gr.update(visible=False), ""
 
-def handle_calib_video_upload(video_path):
-    if video_path is None:
+def toggle_video_calibration(video_path, timestamp_str="0.0"):
+    if not video_path:
+        return gr.update(value=0.0, maximum=10.0), ""
+    try:
+        duration = get_video_duration(video_path)
+        if duration <= 0:
+            duration = 10.0
+        
+        # Parse timestamp from JS time extraction
+        try:
+            timestamp = float(timestamp_str) if timestamp_str else 0.0
+        except ValueError:
+            timestamp = 0.0
+            
+        if timestamp < 0 or timestamp > duration:
+            timestamp = 0.0
+            
+        frame = get_video_frame_at_time(video_path, timestamp)
+        b64_str = ""
+        if frame is not None:
+            import cv2
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            save_calib_reference(rgb)
+            b64_str = get_base64_from_file(CALIB_REF_PATH)
+        return gr.update(value=timestamp, maximum=duration, step=0.1, interactive=True), b64_str
+    except Exception as e:
+        print(f"[-] toggle_video_calibration failed: {e}")
+        return gr.update(value=0.0, maximum=10.0), ""
+
+def handle_slider_change(video_path, timestamp):
+    if not video_path:
         return ""
-    frame = get_video_first_frame(video_path)
-    if frame is not None:
-        import cv2
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        save_calib_reference(rgb)
-        return get_base64_from_file(CALIB_REF_PATH)
+    try:
+        frame = get_video_frame_at_time(video_path, timestamp)
+        if frame is not None:
+            import cv2
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            save_calib_reference(rgb)
+            return get_base64_from_file(CALIB_REF_PATH)
+    except Exception as e:
+        print(f"[-] handle_slider_change failed: {e}")
     return ""
 
-def on_calib_json_change(json_str):
-    if not json_str:
-        return check_calibration_status()
+def handle_timestamp_change(video_path, timestamp_str):
+    if not video_path:
+        return "", gr.update(value=0.0)
     try:
-        data = json.loads(json_str)
-        w = data.get("w", 1280)
-        h = data.get("h", 720)
-        zones_data = data.get("zones", {})
-        save_calibration_data(w, h, zones_data)
-        pipeline.load_calibration()
+        timestamp = float(timestamp_str) if timestamp_str else 0.0
+        frame = get_video_frame_at_time(video_path, timestamp)
+        b64_str = ""
+        if frame is not None:
+            import cv2
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            save_calib_reference(rgb)
+            b64_str = get_base64_from_file(CALIB_REF_PATH)
+        return b64_str, gr.update(value=timestamp)
     except Exception as e:
-        print(f"[-] Error saving JSON calibration: {e}")
-    return check_calibration_status()
+        print(f"[-] handle_timestamp_change failed: {e}")
+    return "", gr.update(value=0.0)
 
 def update_video_preview(video_path, use_custom):
     if video_path is None:
@@ -304,200 +400,331 @@ def update_image_preview(image, use_custom):
         print(f"[-] update_image_preview failed: {e}")
         return image
 
-def get_calibrator_html_code():
-    return """
+def get_calibrator_html_code(prefix):
+    code = """
     <style>
-    .calib-container {
+    /* Scope styles to bypass Gradio preprocessor scope prefixing */
+    body.image-calib-active .gradio-container .contain #image-preview-group {
+      display: none !important;
+    }
+    body.image-calib-active .gradio-container .contain #image-calibrator-group {
+      display: block !important;
+    }
+
+    body.video-calib-active .gradio-container .contain #video-preview-group {
+      display: none !important;
+    }
+    body.video-calib-active .gradio-container .contain #video-calibrator-group {
+      display: block !important;
+    }
+
+    .{prefix}-calib-container {
       display: flex;
       flex-direction: column;
-      gap: 15px;
-      background: rgba(15, 23, 42, 0.4);
+      gap: 12px;
+      background: rgba(15, 23, 42, 0.6);
       border: 1px solid rgba(255, 255, 255, 0.1);
       border-radius: 12px;
       padding: 16px;
-      backdrop-filter: blur(10px);
+      backdrop-filter: blur(12px);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
     }
-    .calib-header {
+    .{prefix}-calib-header {
       border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-      padding-bottom: 10px;
+      padding-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
-    .calib-title {
-      font-size: 1.1rem;
-      font-weight: 600;
-      color: #f1f5f9;
+    .{prefix}-calib-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: #f8fafc;
+      letter-spacing: 0.5px;
     }
-    .calib-panel {
+    .{prefix}-calib-panel {
       display: flex;
       justify-content: space-between;
       align-items: center;
       flex-wrap: wrap;
-      gap: 12px;
-    }
-    .calib-control-group {
-      display: flex;
-      align-items: center;
       gap: 10px;
     }
-    .control-label {
-      font-size: 0.85rem;
-      color: #94a3b8;
-      font-weight: 500;
-    }
-    .zone-pills {
+    .{prefix}-calib-control-group {
       display: flex;
-      gap: 6px;
-      background: rgba(0, 0, 0, 0.2);
+      align-items: center;
+      gap: 8px;
+    }
+    .{prefix}-control-label {
+      font-size: 0.8rem;
+      color: #94a3b8;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .{prefix}-zone-pills {
+      display: flex;
+      gap: 4px;
+      background: rgba(0, 0, 0, 0.3);
       padding: 3px;
       border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
     }
-    .zone-pill {
+    .{prefix}-zone-pill {
       border: none;
       background: transparent;
       color: #94a3b8;
-      padding: 6px 12px;
-      font-size: 0.85rem;
-      font-weight: 600;
+      padding: 5px 10px;
+      font-size: 0.8rem;
+      font-weight: 700;
       border-radius: 6px;
       cursor: pointer;
-      transition: all 0.2s;
+      transition: all 0.2s ease;
     }
-    .zone-pill.active.stop-line {
+    .{prefix}-zone-pill.active.stop-line {
       background: rgba(239, 68, 68, 0.2);
-      color: #ef4444;
-      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.3);
     }
-    .zone-pill.active.exit-line {
+    .{prefix}-zone-pill.active.exit-line {
       background: rgba(249, 115, 22, 0.2);
-      color: #f97316;
-      border: 1px solid rgba(249, 115, 22, 0.4);
+      color: #fb923c;
+      border: 1px solid rgba(249, 115, 22, 0.3);
     }
-    .zone-pill.active.signal-roi {
+    .{prefix}-zone-pill.active.signal-roi {
       background: rgba(34, 197, 94, 0.2);
-      color: #22c55e;
-      border: 1px solid rgba(34, 197, 94, 0.4);
+      color: #4ade80;
+      border: 1px solid rgba(34, 197, 94, 0.3);
     }
-    .action-btns {
+    .{prefix}-action-btns {
       display: flex;
       gap: 6px;
     }
-    .action-btn {
-      background: rgba(30, 41, 59, 0.6);
-      border: 1px solid rgba(255, 255, 255, 0.05);
+    .{prefix}-action-btn {
+      background: rgba(30, 41, 59, 0.8);
+      border: 1px solid rgba(255, 255, 255, 0.1);
       color: #cbd5e1;
       padding: 6px 12px;
       font-size: 0.8rem;
-      font-weight: 500;
+      font-weight: 600;
       border-radius: 6px;
       cursor: pointer;
-      transition: all 0.2s;
+      transition: all 0.2s ease;
     }
-    .action-btn:hover {
-      background: rgba(51, 65, 85, 0.8);
+    .{prefix}-action-btn:hover {
+      background: rgba(51, 65, 85, 0.9);
       color: #ffffff;
+      border-color: rgba(255, 255, 255, 0.2);
     }
-    .canvas-container {
+    .{prefix}-canvas-container {
       position: relative;
       width: 100%;
       aspect-ratio: 16 / 9;
-      background: #090d16;
-      border-radius: 8px;
-      border: 1px solid rgba(255, 255, 255, 0.05);
+      background: #020617;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
       overflow: hidden;
       display: flex;
       justify-content: center;
       align-items: center;
     }
-    #calib-canvas {
+    #{prefix}-calib-canvas {
       width: 100%;
       height: 100%;
       object-fit: contain;
       display: none;
       cursor: crosshair;
     }
-    .placeholder-msg {
+    .{prefix}-placeholder-msg {
       color: #64748b;
-      font-size: 0.9rem;
+      font-size: 0.85rem;
       text-align: center;
       line-height: 1.5;
     }
+    .{prefix}-coord-panel {
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 10px;
+      padding: 12px;
+      margin-top: 10px;
+      box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+    }
     </style>
 
-    <div class="calib-container">
-      <div class="calib-header">
-        <span class="calib-title">📸 Interactive Camera Zone Calibrator</span>
+    <div class="{prefix}-calib-container">
+      <div class="{prefix}-calib-header">
+        <span class="{prefix}-calib-title">📸 Interactive Region Calibrator (6-Point Mode)</span>
       </div>
       
-      <div class="calib-panel">
-        <div class="calib-control-group">
-          <span class="control-label">Select Active Zone:</span>
-          <div class="zone-pills">
-            <button id="btn-stop-line" class="zone-pill active stop-line" onclick="setZone('stop_line')">🟥 Stop Line</button>
-            <button id="btn-exit-line" class="zone-pill exit-line" onclick="setZone('exit_line')">🟧 Exit Zone</button>
-            <button id="btn-signal-roi" class="zone-pill signal-roi" onclick="setZone('signal_roi')">🟩 Signal ROI</button>
+      <div class="{prefix}-calib-panel">
+        <div class="{prefix}-calib-control-group">
+          <span class="{prefix}-control-label">Zone:</span>
+          <div class="{prefix}-zone-pills">
+            <button id="{prefix}-btn-stop-line" class="{prefix}-zone-pill active stop-line" onclick="window.{prefix}SetZone('stop_line')">🟥 Stop Line</button>
+            <button id="{prefix}-btn-exit-line" class="{prefix}-zone-pill exit-line" onclick="window.{prefix}SetZone('exit_line')">🟧 Exit Zone</button>
+            <button id="{prefix}-btn-signal-roi" class="{prefix}-zone-pill signal-roi" onclick="window.{prefix}SetZone('signal_roi')">🟩 Signal ROI</button>
+          </div>
+        </div>
+
+        <div class="{prefix}-calib-control-group">
+          <span class="{prefix}-control-label">Active:</span>
+          <div style="display: flex; gap: 10px; align-items: center; background: rgba(0, 0, 0, 0.3); padding: 5px 10px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.05);">
+            <label style="display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: #cbd5e1; cursor: pointer; user-select: none; font-weight: 700;">
+              <input type="checkbox" id="{prefix}-toggle-stop-line" checked onchange="window.{prefix}ToggleZone('stop_line', this.checked)" style="accent-color: #ef4444; width: 14px; height: 14px; cursor: pointer;"> Stop Line
+            </label>
+            <label style="display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: #cbd5e1; cursor: pointer; user-select: none; font-weight: 700;">
+              <input type="checkbox" id="{prefix}-toggle-exit-line" checked onchange="window.{prefix}ToggleZone('exit_line', this.checked)" style="accent-color: #f97316; width: 14px; height: 14px; cursor: pointer;"> Exit Zone
+            </label>
+            <label style="display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: #cbd5e1; cursor: pointer; user-select: none; font-weight: 700;">
+              <input type="checkbox" id="{prefix}-toggle-signal-roi" checked onchange="window.{prefix}ToggleZone('signal_roi', this.checked)" style="accent-color: #22c55e; width: 14px; height: 14px; cursor: pointer;"> Signal ROI
+            </label>
           </div>
         </div>
         
-        <div class="calib-control-group">
-          <div class="action-btns">
-            <button class="action-btn undo-btn" onclick="undoPoint()">⏪ Undo Point</button>
-            <button class="action-btn clear-btn" onclick="clearZone()">❌ Clear Active Zone</button>
-            <button class="action-btn reset-btn" onclick="resetAllZones()">🔄 Reset All Zones</button>
+        <div class="{prefix}-calib-control-group">
+          <div class="{prefix}-action-btns">
+            <button class="{prefix}-action-btn" onclick="window.{prefix}ResetActiveZone()">🔄 Reset Active</button>
+            <button class="{prefix}-action-btn" onclick="window.{prefix}ResetAllZones()">🔄 Reset All</button>
           </div>
         </div>
       </div>
 
-      <div class="canvas-container">
-        <canvas id="calib-canvas"></canvas>
-        <div id="no-image-msg" class="placeholder-msg">
-          No calibration reference frame loaded.<br>Please upload an image or video in the left panel to begin.
+      <div class="{prefix}-canvas-container">
+        <canvas id="{prefix}-calib-canvas"></canvas>
+        <div id="{prefix}-no-image-msg" class="{prefix}-placeholder-msg">
+          No reference frame loaded.<br>Upload an image or adjust the timestamp slider to calibrate zones.
         </div>
       </div>
-    </div>
+
+      <div id="{prefix}-coord-panel" class="{prefix}-coord-panel">
+        <!-- real-time coordinates -->
+      </div>
+      <!-- Note: Closing div is moved to the end of the script block so that script is nested inside container -->
 
     <script>
     (function() {
+      const prefix = "{prefix}";
+      if (window.{prefix}CalibImageCheckInterval) {
+        clearInterval(window.{prefix}CalibImageCheckInterval);
+      }
+      if (window.{prefix}CalibJsonCheckInterval) {
+        clearInterval(window.{prefix}CalibJsonCheckInterval);
+      }
+
       let zones = { stop_line: [], exit_line: [], signal_roi: [] };
       let activeZone = 'stop_line';
       let draggedPoint = null;
       let hoveredPoint = null;
+      let selectedPoint = null;
+      let isDraggingPolygon = false;
+      let dragStartPos = { x: 0, y: 0 };
+      let polygonStartPoints = [];
       let img = new Image();
       let isImageLoaded = false;
       
+      let zoneBackups = { stop_line: null, exit_line: null, signal_roi: null };
+      let zoneEnabled = { stop_line: true, exit_line: true, signal_roi: true };
+      
       const colors = {
-        stop_line: { stroke: '#ef4444', fill: 'rgba(239, 68, 68, 0.25)', label: 'STOP LINE ZONE' },
-        exit_line: { stroke: '#f97316', fill: 'rgba(249, 115, 22, 0.25)', label: 'EXIT ZONE' },
-        signal_roi: { stroke: '#22c55e', fill: 'rgba(34, 197, 94, 0.15)', label: 'SIGNAL ROI' }
+        stop_line: { stroke: '#ef4444', fill: 'rgba(239, 68, 68, 0.22)', label: 'STOP LINE ZONE' },
+        exit_line: { stroke: '#f97316', fill: 'rgba(249, 115, 22, 0.22)', label: 'EXIT ZONE' },
+        signal_roi: { stroke: '#22c55e', fill: 'rgba(34, 197, 94, 0.12)', label: 'SIGNAL ROI' }
       };
       
+      function getInitialPoints(zoneName, w, h) {
+        let yTop, yBottom;
+        if (zoneName === 'stop_line') {
+          yTop = Math.round(h * 0.35);
+          yBottom = Math.round(h * 0.48);
+        } else if (zoneName === 'exit_line') {
+          yTop = Math.round(h * 0.60);
+          yBottom = Math.round(h * 0.73);
+        } else {
+          yTop = Math.round(h * 0.10);
+          yBottom = Math.round(h * 0.25);
+        }
+        
+        const xLeft = Math.round(w * 0.3);
+        const xMid = Math.round(w * 0.5);
+        const xRight = Math.round(w * 0.7);
+        
+        return [
+          [xLeft, yTop],      // 1. Top-Left
+          [xMid, yTop],       // 2. Top-Middle
+          [xRight, yTop],      // 3. Top-Right
+          [xRight, yBottom],   // 4. Bottom-Right
+          [xMid, yBottom],    // 5. Bottom-Middle
+          [xLeft, yBottom]     // 6. Bottom-Left
+        ];
+      }
+
+      function enforceExactly6Points(w, h) {
+        const zoneNames = ['stop_line', 'exit_line', 'signal_roi'];
+        for (const zName of zoneNames) {
+          if (zoneEnabled[zName]) {
+            if (!zones[zName] || zones[zName].length !== 6) {
+              zones[zName] = getInitialPoints(zName, w, h);
+            }
+          } else {
+            zones[zName] = [];
+          }
+        }
+      }
+
+      function pointInPolygon(x, y, pts) {
+        let inside = false;
+        for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+          const xi = pts[i][0], yi = pts[i][1];
+          const xj = pts[j][0], yj = pts[j][1];
+          const intersect = ((yi > y) !== (yj > y)) &&
+                            (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+          if (intersect) inside = !inside;
+        }
+        return inside;
+      }
+
       function init() {
-        const canvas = document.getElementById("calib-canvas");
-        const placeholder = document.getElementById("no-image-msg");
+        const canvas = document.getElementById("{prefix}-calib-canvas");
+        const placeholder = document.getElementById("{prefix}-no-image-msg");
         if (!canvas || !placeholder) {
           setTimeout(init, 100);
           return;
         }
         
+        canvas.removeEventListener('mousedown', handleMouseDown);
+        canvas.removeEventListener('mousemove', handleMouseMove);
         canvas.addEventListener('mousedown', handleMouseDown);
         canvas.addEventListener('mousemove', handleMouseMove);
+        
+        window.removeEventListener('mouseup', handleMouseUp);
         window.addEventListener('mouseup', handleMouseUp);
         
+        // Touch supports
+        canvas.removeEventListener('touchstart', handleTouchStart);
+        canvas.removeEventListener('touchmove', handleTouchMove);
+        canvas.removeEventListener('touchend', handleTouchEnd);
         canvas.addEventListener('touchstart', handleTouchStart, { passive: false });
         canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
         canvas.addEventListener('touchend', handleTouchEnd, { passive: false });
         
+        // Keyboard nudges
+        window.removeEventListener('keydown', handleKeyDown);
+        window.addEventListener('keydown', handleKeyDown);
+
         let lastSrc = "";
-        setInterval(() => {
-          const srcTextarea = document.querySelector("#calib-image-src textarea");
+        window.{prefix}CalibImageCheckInterval = setInterval(() => {
+          const srcTextarea = document.querySelector("#{prefix}-calib-image-src textarea, #{prefix}-calib-image-src input");
           if (srcTextarea && srcTextarea.value !== lastSrc) {
             lastSrc = srcTextarea.value;
             if (lastSrc) {
-              img.src = lastSrc;
               img.onload = function() {
                 isImageLoaded = true;
                 canvas.style.display = "block";
                 placeholder.style.display = "none";
+                enforceExactly6Points(img.naturalWidth || 1280, img.naturalHeight || 720);
+                saveState();
                 redraw();
               };
+              img.src = lastSrc;
             } else {
               isImageLoaded = false;
               canvas.style.display = "none";
@@ -506,9 +733,37 @@ def get_calibrator_html_code():
           }
         }, 250);
         
+        if (prefix === "vid") {
+          if (window.vidPlayerSyncInterval) {
+            clearInterval(window.vidPlayerSyncInterval);
+          }
+          window.vidPlayerSyncInterval = setInterval(() => {
+            const videoEl = document.querySelector('#video-input video');
+            if (videoEl && !videoEl.dataset.hasCalibListener) {
+              videoEl.dataset.hasCalibListener = "true";
+              
+              const syncFrame = () => {
+                if (document.body.classList.contains('video-calib-active')) {
+                  const tsInput = document.querySelector('#video-calib-timestamp textarea, #video-calib-timestamp input');
+                  if (tsInput) {
+                    const diff = Math.abs(parseFloat(tsInput.value || "0") - videoEl.currentTime);
+                    if (diff > 0.05) {
+                      tsInput.value = videoEl.currentTime.toString();
+                      tsInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                  }
+                }
+              };
+              
+              videoEl.addEventListener('seeked', syncFrame);
+              videoEl.addEventListener('pause', syncFrame);
+            }
+          }, 500);
+        }
+        
         let lastJson = "";
-        setInterval(() => {
-          const jsonTextarea = document.querySelector("#calib-json-input textarea");
+        window.{prefix}CalibJsonCheckInterval = setInterval(() => {
+          const jsonTextarea = document.querySelector("#{prefix}-calib-json-input textarea, #{prefix}-calib-json-input input");
           if (jsonTextarea && jsonTextarea.value !== lastJson) {
             lastJson = jsonTextarea.value;
             if (lastJson) {
@@ -516,6 +771,44 @@ def get_calibrator_html_code():
                 const data = JSON.parse(lastJson);
                 if (data && data.zones) {
                   zones = data.zones;
+                  const fromFile = data.from_file !== false; // If from_file isn't explicitly false, treat it as true
+                  
+                  // Update toggles and button states based on loaded zones
+                  for (const zName of ['stop_line', 'exit_line', 'signal_roi']) {
+                    const hasPoints = zones[zName] && zones[zName].length >= 2;
+                    let isEnabled = hasPoints;
+                    if (!fromFile) {
+                      isEnabled = true; // Default to enabled if no saved file exists
+                    }
+                    
+                    zoneEnabled[zName] = isEnabled;
+                    
+                    const toggleInput = document.getElementById(`{prefix}-toggle-${zName.replace('_', '-')}`);
+                    if (toggleInput) toggleInput.checked = isEnabled;
+                    
+                    const btn = document.getElementById(`{prefix}-btn-${zName.replace('_', '-')}`);
+                    if (btn) {
+                      btn.disabled = !isEnabled;
+                      btn.style.opacity = isEnabled ? "1" : "0.4";
+                      btn.style.pointerEvents = isEnabled ? "auto" : "none";
+                    }
+                  }
+                  
+                  // Ensure active zone is an enabled one
+                  if (!zoneEnabled[activeZone]) {
+                    const remaining = Object.keys(zoneEnabled).find(k => zoneEnabled[k]);
+                    if (remaining) {
+                      activeZone = remaining;
+                      document.querySelectorAll('.{prefix}-zone-pill').forEach(b => b.classList.remove('active'));
+                      const activeBtn = document.getElementById(`{prefix}-btn-${remaining.replace('_', '-')}`);
+                      if (activeBtn) activeBtn.classList.add('active');
+                    } else {
+                      activeZone = null;
+                      document.querySelectorAll('.{prefix}-zone-pill').forEach(b => b.classList.remove('active'));
+                    }
+                  }
+                  
+                  enforceExactly6Points(img.naturalWidth || 1280, img.naturalHeight || 720);
                   redraw();
                 }
               } catch(e) {
@@ -526,40 +819,107 @@ def get_calibrator_html_code():
         }, 500);
       }
       
-      window.setZone = function(zoneName) {
-        activeZone = zoneName;
-        document.querySelectorAll('.zone-pill').forEach(btn => btn.classList.remove('active'));
-        const activeBtn = document.getElementById(`btn-${zoneName.replace('_', '-')}`);
-        if (activeBtn) activeBtn.classList.add('active');
+      window.{prefix}ToggleZone = function(zoneName, isEnabled) {
+        zoneEnabled[zoneName] = isEnabled;
+        const btn = document.getElementById(`{prefix}-btn-${zoneName.replace('_', '-')}`);
+        
+        if (isEnabled) {
+          if (btn) {
+            btn.disabled = false;
+            btn.style.opacity = "1";
+            btn.style.pointerEvents = "auto";
+          }
+          // Restore points
+          if (zoneBackups[zoneName] && zoneBackups[zoneName].length === 6) {
+            zones[zoneName] = zoneBackups[zoneName];
+          } else {
+            const w = img.naturalWidth || 1280;
+            const h = img.naturalHeight || 720;
+            zones[zoneName] = getInitialPoints(zoneName, w, h);
+          }
+          // Set as active zone since user just enabled it
+          window.{prefix}SetZone(zoneName);
+        } else {
+          if (btn) {
+            btn.disabled = true;
+            btn.style.opacity = "0.4";
+            btn.style.pointerEvents = "none";
+          }
+          // Backup current points before clearing if they are valid
+          if (zones[zoneName] && zones[zoneName].length === 6) {
+            zoneBackups[zoneName] = zones[zoneName];
+          }
+          zones[zoneName] = [];
+          
+          // If we disabled the active zone, switch active zone to any remaining enabled zone
+          if (activeZone === zoneName) {
+            const remaining = Object.keys(zoneEnabled).find(k => zoneEnabled[k]);
+            if (remaining) {
+              window.{prefix}SetZone(remaining);
+            } else {
+              activeZone = null;
+              document.querySelectorAll('.{prefix}-zone-pill').forEach(b => b.classList.remove('active'));
+            }
+          }
+        }
+        
+        saveState();
         redraw();
       };
       
-      window.undoPoint = function() {
-        if (zones[activeZone] && zones[activeZone].length > 0) {
-          zones[activeZone].pop();
+      window.{prefix}SetZone = function(zoneName) {
+        if (!zoneEnabled[zoneName]) return;
+        activeZone = zoneName;
+        document.querySelectorAll('.{prefix}-zone-pill').forEach(btn => btn.classList.remove('active'));
+        const activeBtn = document.getElementById(`{prefix}-btn-${zoneName.replace('_', '-')}`);
+        if (activeBtn) activeBtn.classList.add('active');
+        selectedPoint = null;
+        redraw();
+      };
+      
+      window.{prefix}ResetActiveZone = function() {
+        if (isImageLoaded && activeZone) {
+          zones[activeZone] = getInitialPoints(activeZone, img.naturalWidth || 1280, img.naturalHeight || 720);
           saveState();
           redraw();
         }
       };
       
-      window.clearZone = function() {
-        if (zones[activeZone]) {
-          zones[activeZone] = [];
-          saveState();
-          redraw();
-        }
-      };
-      
-      window.resetAllZones = function() {
-        if (confirm("Are you sure you want to reset all calibrated zones?")) {
-          zones = { stop_line: [], exit_line: [], signal_roi: [] };
+      window.{prefix}ResetAllZones = function() {
+        if (confirm("Reset all zones to default rectangles?")) {
+          const w = img.naturalWidth || 1280;
+          const h = img.naturalHeight || 720;
+          
+          // Reset enabled state to true for all zones
+          for (const zName of ['stop_line', 'exit_line', 'signal_roi']) {
+            zoneEnabled[zName] = true;
+            const toggleInput = document.getElementById(`{prefix}-toggle-${zName.replace('_', '-')}`);
+            if (toggleInput) toggleInput.checked = true;
+            const btn = document.getElementById(`{prefix}-btn-${zName.replace('_', '-')}`);
+            if (btn) {
+              btn.disabled = false;
+              btn.style.opacity = "1";
+              btn.style.pointerEvents = "auto";
+            }
+          }
+          
+          activeZone = 'stop_line';
+          document.querySelectorAll('.{prefix}-zone-pill').forEach(btn => btn.classList.remove('active'));
+          const activeBtn = document.getElementById(`{prefix}-btn-stop-line`);
+          if (activeBtn) activeBtn.classList.add('active');
+          
+          zones = {
+            stop_line: getInitialPoints('stop_line', w, h),
+            exit_line: getInitialPoints('exit_line', w, h),
+            signal_roi: getInitialPoints('signal_roi', w, h)
+          };
           saveState();
           redraw();
         }
       };
       
       function saveState() {
-        const jsonTextarea = document.querySelector("#calib-json-input textarea");
+        const jsonTextarea = document.querySelector("#{prefix}-calib-json-input textarea, #{prefix}-calib-json-input input");
         if (jsonTextarea) {
           const payload = {
             w: img.naturalWidth || 1280,
@@ -569,10 +929,11 @@ def get_calibrator_html_code():
           jsonTextarea.value = JSON.stringify(payload);
           jsonTextarea.dispatchEvent(new Event("input", { bubbles: true }));
         }
+        updateCoordinateTable();
       }
       
       function getMousePos(e) {
-        const canvas = document.getElementById("calib-canvas");
+        const canvas = document.getElementById("{prefix}-calib-canvas");
         const rect = canvas.getBoundingClientRect();
         
         let clientX, clientY;
@@ -601,10 +962,10 @@ def get_calibrator_html_code():
         if (!isImageLoaded) return;
         const pos = getMousePos(e);
         
-        const canvas = document.getElementById("calib-canvas");
+        const canvas = document.getElementById("{prefix}-calib-canvas");
         const rect = canvas.getBoundingClientRect();
         let clickedIndex = -1;
-        let minDist = 12;
+        let minDist = 15;
         
         const pts = zones[activeZone] || [];
         for (let i = 0; i < pts.length; i++) {
@@ -620,14 +981,18 @@ def get_calibrator_html_code():
         
         if (clickedIndex !== -1) {
           draggedPoint = { zone: activeZone, index: clickedIndex };
+          selectedPoint = { zone: activeZone, index: clickedIndex };
           canvas.style.cursor = 'grabbing';
+          redraw();
         } else {
-          if (pts.length < 10) {
-            zones[activeZone].push([pos.imgX, pos.imgY]);
-            saveState();
+          if (pts.length >= 3 && pointInPolygon(pos.imgX, pos.imgY, pts)) {
+            isDraggingPolygon = true;
+            dragStartPos = { x: pos.imgX, y: pos.imgY };
+            polygonStartPoints = JSON.parse(JSON.stringify(pts));
+            canvas.style.cursor = 'move';
+          } else {
+            selectedPoint = null;
             redraw();
-            draggedPoint = { zone: activeZone, index: zones[activeZone].length - 1 };
-            canvas.style.cursor = 'grabbing';
           }
         }
       }
@@ -635,7 +1000,7 @@ def get_calibrator_html_code():
       function handleMouseMove(e) {
         if (!isImageLoaded) return;
         const pos = getMousePos(e);
-        const canvas = document.getElementById("calib-canvas");
+        const canvas = document.getElementById("{prefix}-calib-canvas");
         const rect = canvas.getBoundingClientRect();
         
         if (draggedPoint) {
@@ -643,6 +1008,27 @@ def get_calibrator_html_code():
           const clampedY = Math.max(0, Math.min(img.naturalHeight, pos.imgY));
           zones[draggedPoint.zone][draggedPoint.index] = [clampedX, clampedY];
           redraw(pos.canvasX, pos.canvasY, clampedX, clampedY);
+        } else if (isDraggingPolygon) {
+          const dx = pos.imgX - dragStartPos.x;
+          const dy = pos.imgY - dragStartPos.y;
+          const pts = zones[activeZone];
+          
+          let validMove = true;
+          for (let i = 0; i < pts.length; i++) {
+            const newX = polygonStartPoints[i][0] + dx;
+            const newY = polygonStartPoints[i][1] + dy;
+            if (newX < 0 || newX > img.naturalWidth || newY < 0 || newY > img.naturalHeight) {
+              validMove = false;
+              break;
+            }
+          }
+          
+          if (validMove) {
+            for (let i = 0; i < pts.length; i++) {
+              pts[i] = [polygonStartPoints[i][0] + dx, polygonStartPoints[i][1] + dy];
+            }
+            redraw();
+          }
         } else {
           let isHovering = false;
           const pts = zones[activeZone] || [];
@@ -651,7 +1037,7 @@ def get_calibrator_html_code():
             const screenX = (pt[0] / img.naturalWidth) * rect.width;
             const screenY = (pt[1] / img.naturalHeight) * rect.height;
             const dist = Math.sqrt(Math.pow(screenX - pos.canvasX, 2) + Math.pow(screenY - pos.canvasY, 2));
-            if (dist < 12) {
+            if (dist < 15) {
               isHovering = true;
               hoveredPoint = { zone: activeZone, index: i };
               break;
@@ -659,6 +1045,9 @@ def get_calibrator_html_code():
           }
           if (isHovering) {
             canvas.style.cursor = 'pointer';
+          } else if (pts.length >= 3 && pointInPolygon(pos.imgX, pos.imgY, pts)) {
+            canvas.style.cursor = 'grab';
+            hoveredPoint = null;
           } else {
             canvas.style.cursor = 'crosshair';
             hoveredPoint = null;
@@ -668,9 +1057,10 @@ def get_calibrator_html_code():
       }
       
       function handleMouseUp(e) {
-        if (draggedPoint) {
+        if (draggedPoint || isDraggingPolygon) {
           draggedPoint = null;
-          const canvas = document.getElementById("calib-canvas");
+          isDraggingPolygon = false;
+          const canvas = document.getElementById("{prefix}-calib-canvas");
           if (canvas) canvas.style.cursor = 'crosshair';
           saveState();
           redraw();
@@ -691,9 +1081,53 @@ def get_calibrator_html_code():
         e.preventDefault();
         handleMouseUp(e);
       }
+
+      function handleKeyDown(e) {
+        if (!selectedPoint || !isImageLoaded) return;
+        let step = e.shiftKey ? 10 : 1;
+        let dx = 0, dy = 0;
+        if (e.key === 'ArrowUp') dy = -step;
+        else if (e.key === 'ArrowDown') dy = step;
+        else if (e.key === 'ArrowLeft') dx = -step;
+        else if (e.key === 'ArrowRight') dx = step;
+        else return;
+        
+        e.preventDefault();
+        const pts = zones[selectedPoint.zone];
+        const pt = pts[selectedPoint.index];
+        pt[0] = Math.max(0, Math.min(img.naturalWidth, pt[0] + dx));
+        pt[1] = Math.max(0, Math.min(img.naturalHeight, pt[1] + dy));
+        saveState();
+        redraw();
+      }
       
+      function updateCoordinateTable() {
+        const panel = document.getElementById("{prefix}-coord-panel");
+        if (!panel) return;
+        if (!activeZone) {
+          panel.innerHTML = `<div style="text-align:center;color:#64748b;font-size:0.85rem;padding:10px;background:rgba(0,0,0,0.2);border-radius:4px;border:1px solid rgba(255,255,255,0.05);">No active zone selected. Enable a zone using the checkboxes above to edit.</div>`;
+          return;
+        }
+        const pts = zones[activeZone] || [];
+        let html = `<div style="font-weight:700;margin-bottom:6px;color:#cbd5e1;display:flex;justify-content:space-between;align-items:center;">
+                      <span>📍 Coordinates Panel (${activeZone.replace('_', ' ').toUpperCase()})</span>
+                      <span style="font-size:0.75rem;background:#1e293b;padding:2px 6px;border-radius:4px;color:#94a3b8;">6-Point Closed Rectangle</span>
+                    </div>`;
+        html += `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;font-size:0.8rem;color:#94a3b8;">`;
+        for (let i = 0; i < 6; i++) {
+          const pt = pts[i] || [0, 0];
+          const isSelected = selectedPoint && selectedPoint.zone === activeZone && selectedPoint.index === i;
+          const style = isSelected ? "border:1px solid #3b82f6;background:rgba(59,130,246,0.1);color:#60a5fa;" : "border:1px solid rgba(255,255,255,0.08);background:rgba(0,0,0,0.2);";
+          html += `<div style="padding:4px 6px;border-radius:4px;${style}text-align:center;">
+                     <span style="font-weight:bold;color:#f1f5f9;">#${i+1}:</span> (${pt[0]}, ${pt[1]})
+                   </div>`;
+        }
+        html += `</div>`;
+        panel.innerHTML = html;
+      }
+
       function redraw(dragCanvasX, dragCanvasY, dragImgX, dragImgY) {
-        const canvas = document.getElementById("calib-canvas");
+        const canvas = document.getElementById("{prefix}-calib-canvas");
         if (!canvas || !isImageLoaded) return;
         const ctx = canvas.getContext("2d");
         
@@ -735,22 +1169,34 @@ def get_calibrator_html_code():
             const pt = pts[i];
             const isHovered = hoveredPoint && hoveredPoint.zone === zoneName && hoveredPoint.index === i;
             const isDragged = draggedPoint && draggedPoint.zone === zoneName && draggedPoint.index === i;
+            const isSelected = selectedPoint && selectedPoint.zone === zoneName && selectedPoint.index === i;
             
             ctx.fillStyle = style.stroke;
             ctx.beginPath();
-            ctx.arc(pt[0], pt[1], Math.max(6, Math.round(img.naturalWidth / 150.0)), 0, Math.PI * 2);
+            ctx.arc(pt[0], pt[1], Math.max(8, Math.round(img.naturalWidth / 120.0)), 0, Math.PI * 2);
             ctx.fill();
             
-            if (isHovered || isDragged) {
+            if (isHovered || isDragged || isSelected) {
               ctx.strokeStyle = '#ffffff';
-              ctx.lineWidth = Math.max(2, Math.round(img.naturalWidth / 300.0));
+              ctx.lineWidth = Math.max(3, Math.round(img.naturalWidth / 250.0));
+              ctx.stroke();
+            } else {
+              ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+              ctx.lineWidth = 1.5;
               ctx.stroke();
             }
+
+            ctx.fillStyle = '#ffffff';
+            ctx.font = `bold ${Math.max(10, Math.round(img.naturalWidth / 100.0))}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(i + 1, pt[0], pt[1]);
             
             if (i === 0) {
               ctx.fillStyle = '#ffffff';
               ctx.font = `bold ${Math.max(14, Math.round(img.naturalWidth / 60.0))}px sans-serif`;
-              ctx.fillText(style.label, pt[0] + 15, pt[1] - 8);
+              ctx.textAlign = 'left';
+              ctx.fillText(`${style.label}`, pt[0] + 20, pt[1] - 8);
             }
           }
         }
@@ -798,6 +1244,22 @@ def get_calibrator_html_code():
         ctx.moveTo(loupeX - 15, loupeY); ctx.lineTo(loupeX + 15, loupeY);
         ctx.moveTo(loupeX, loupeY - 15); ctx.lineTo(loupeX, loupeY + 15);
         ctx.stroke();
+
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.lineWidth = 0.5;
+        const cellSize = zoom;
+        for (let x = loupeX - loupeRadius; x < loupeX + loupeRadius; x += cellSize) {
+          ctx.beginPath();
+          ctx.moveTo(x, loupeY - loupeRadius);
+          ctx.lineTo(x, loupeY + loupeRadius);
+          ctx.stroke();
+        }
+        for (let y = loupeY - loupeRadius; y < loupeY + loupeRadius; y += cellSize) {
+          ctx.beginPath();
+          ctx.moveTo(loupeX - loupeRadius, y);
+          ctx.lineTo(loupeX + loupeRadius, y);
+          ctx.stroke();
+        }
         
         ctx.restore();
         
@@ -816,7 +1278,26 @@ def get_calibrator_html_code():
       init();
     })();
     </script>
+    </div>
     """
+    return code.replace("{prefix}", prefix)
+
+def on_save_click_b64(json_str):
+    if not json_str:
+        return "<div style='color: #ef4444;'>❌ No calibration data to save.</div>", check_calibration_status()
+    try:
+        import json
+        data = json.loads(json_str)
+        w = data.get("w") or data.get("frame_width") or 1280
+        h = data.get("h") or data.get("frame_height") or 720
+        zones_data = data.get("zones", {})
+        
+        # Save to calibration.json
+        save_calibration_data(w, h, zones_data)
+        pipeline.load_calibration()
+        return "<div style='background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); padding: 12px; border-radius: 8px; margin-bottom: 15px; color: #4ade80;'><strong>✅ Calibration saved successfully to calibration.json!</strong></div>", check_calibration_status()
+    except Exception as e:
+        return f"<div style='background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); padding: 12px; border-radius: 8px; margin-bottom: 15px; color: #ef4444;'><strong>❌ Error saving calibration:</strong> {str(e)}</div>", check_calibration_status()
 
 def process_traffic_image(image, helmet_model_type, use_custom_line, direction_str):
     if image is None:
@@ -897,7 +1378,8 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
             "[]",
             empty_df,
             pd.DataFrame(history_list) if history_list else empty_df,
-            gr.update(visible=False)
+            gr.update(visible=False),
+            gr.update()
         )
         return
         
@@ -910,7 +1392,7 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
     logs = ["[*] Starting video analysis pipeline..."]
     global_df = pd.DataFrame(history_list) if history_list else empty_df
     
-    yield "\n".join(logs), gr.update(visible=False), "[]", empty_df, global_df, gr.update(visible=False)
+    yield "\n".join(logs), gr.update(visible=False), "[]", empty_df, global_df, gr.update(visible=False), gr.update()
     
     try:
         direction = "away" if "away" in direction_str.lower() else "towards"
@@ -945,7 +1427,10 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
                 })
             current_df = pd.DataFrame(current_rows) if current_rows else empty_df
             
-            yield visible_logs, gr.update(visible=False), json.dumps(val, indent=2), current_df, global_df, gr.update(value=live_frame, visible=True)
+            # Convert live frame to base64 to stream to the canvas
+            b64_frame = get_base64_from_file(live_frame)
+            
+            yield visible_logs, gr.update(visible=False), json.dumps(val, indent=2), current_df, global_df, gr.update(value=live_frame, visible=True), b64_frame
             
         # Final yield
         final_violations = final_res["violations"]
@@ -974,7 +1459,7 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
         logs.append(f"[+] Output saved to: {final_res['processed_video']}")
         visible_logs = "\n".join(logs[-15:])
         
-        yield visible_logs, gr.update(value=final_res["processed_video"], visible=True), json.dumps(final_violations, indent=2), final_df, updated_global_df, gr.update(value=None, visible=False)
+        yield visible_logs, gr.update(value=final_res["processed_video"], visible=True), json.dumps(final_violations, indent=2), final_df, updated_global_df, gr.update(value=None, visible=False), gr.update()
         
     except Exception as e:
         import traceback
@@ -986,7 +1471,8 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
             "[]",
             empty_df,
             pd.DataFrame(history_list) if history_list else empty_df,
-            gr.update(visible=False)
+            gr.update(visible=False),
+            gr.update()
         )
 
 
@@ -1055,10 +1541,19 @@ img {
     -moz-user-select: none !important;
     -ms-user-select: none !important;
 }
+.hidden-textbox {
+    display: none !important;
+}
+
+/* Hide calibrator groups by default */
+#video-calibrator-group,
+#image-calibrator-group {
+    display: none !important;
+}
 """
 
 # Build the Gradio UI
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), css=css) as demo:
+with gr.Blocks() as demo:
     gr.Markdown(
         """
         # 🚦 Automated Traffic Violation Detection & Classification System
@@ -1068,33 +1563,8 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), 
         """
     )
     
-    session_calibration = gr.State(value=load_session_calibration)
-    
     calibration_status = gr.HTML(value=check_calibration_status())
     
-    with gr.Tab("Camera Zone Calibration"):
-        with gr.Row():
-            with gr.Column(scale=1):
-                calib_image_input = gr.Image(type="numpy", label="Upload Reference Photo (Option A)")
-                calib_video_input = gr.Video(label="Upload Reference Video (Option B)")
-                gr.Markdown(
-                    """
-                    ### 🚦 Calibration Guide:
-                    1. **Stop Line Zone** (Red): Draw 4 points defining the stop-line area.
-                    2. **Exit Zone** (Orange): Draw 4 points further down the lane.
-                    3. **Signal ROI** (Green): Draw a box around the traffic signal light.
-                    
-                    *Drag points directly to adjust. Click near a point to drag it. Click elsewhere to add a point.*
-                    """
-                )
-            with gr.Column(scale=2):
-                # Hidden communication elements
-                calib_image_src = gr.Textbox(visible=False, elem_id="calib-image-src", value=load_initial_calib_base64())
-                calib_json_input = gr.Textbox(visible=False, elem_id="calib-json-input", value=load_initial_calib_json())
-                
-                # HTML5 Calibrator Component
-                calibrator_html = gr.HTML(value=get_calibrator_html_code())
-                
     with gr.Tab("Single Image Violations"):
         with gr.Row():
             with gr.Column(scale=1):
@@ -1107,19 +1577,36 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), 
                     )
                     use_custom_line_image = gr.Checkbox(label="Use Custom Stop Zone Calibration", value=True)
                     direction_image = gr.Radio(choices=["Towards Camera", "Away from Camera"], value="Towards Camera", label="Traffic Flow Direction")
+                
+                setup_calib_img_btn = gr.Button("🔧 Setup Stop Line / Calibration", variant="secondary")
                 process_btn = gr.Button("🚀 Analyze Image", variant="primary")
             
             with gr.Column(scale=1):
-                image_output = gr.Image(type="numpy", label="Annotated Evidence Output / Calibration Preview", interactive=False)
-                signal_status_output = gr.Textbox(label="Detected Signal State", interactive=False)
+                # Normal image output preview group (visible by default)
+                with gr.Group(elem_id="image-preview-group") as image_preview_group:
+                    image_output = gr.Image(type="numpy", label="Annotated Evidence Output / Calibration Preview", interactive=False)
+                    signal_status_output = gr.Textbox(label="Detected Signal State", interactive=False)
                 
+                # Image Calibrator Canvas group (hidden by default, always in DOM)
+                with gr.Group(elem_id="image-calibrator-group") as image_calibrator_group:
+                    # Hidden communication elements
+                    image_calib_image_src = gr.Textbox(elem_id="img-calib-image-src", elem_classes=["hidden-textbox"], value="")
+                    image_calib_json_input = gr.Textbox(elem_id="img-calib-json-input", elem_classes=["hidden-textbox"], value=load_initial_calib_json())
+                    img_calibrator_html = gr.HTML(value=get_calibrator_html_code("img"))
+                    with gr.Row():
+                        save_img_calib_btn = gr.Button("💾 Save Calibration", variant="primary")
+                        close_img_calib_btn = gr.Button("❌ Close Calibration Panel", variant="secondary")
+                    img_save_status = gr.HTML(value="")
+
         with gr.Row():
             violations_output = gr.Code(label="Flagged Violations (JSON)", language="json")
             
     with gr.Tab("Video Violations"):
         with gr.Row():
             with gr.Column(scale=1):
-                video_input = gr.Video(label="Upload Traffic Video")
+                video_input = gr.Video(label="Upload Traffic Video", elem_id="video-input")
+                # Hidden element to store current player time before toggling
+                video_calib_timestamp = gr.Textbox(elem_id="video-calib-timestamp", elem_classes=["hidden-textbox"], value="0.0")
                 with gr.Group():
                     video_helmet_dropdown = gr.Dropdown(
                         choices=["iam-tsr (YOLOv8-Nano)", "jarvanlee (YOLOv8-Medium)"],
@@ -1128,12 +1615,28 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), 
                     )
                     use_custom_line_video = gr.Checkbox(label="Use Custom Stop Zone Calibration", value=True)
                     direction_video = gr.Radio(choices=["Towards Camera", "Away from Camera"], value="Away from Camera", label="Traffic Flow Direction")
+                
+                setup_calib_vid_btn = gr.Button("🔧 Setup Stop Line / Calibration", variant="secondary")
                 video_process_btn = gr.Button("🚀 Analyze Video", variant="primary")
                 
             with gr.Column(scale=1):
-                live_frame_output = gr.Image(label="Live Feed / Calibration Line Preview", type="numpy", interactive=False)
-                video_output = gr.Video(label="Final Processed Video (H.264 Playback)", visible=False)
-                video_log_output = gr.Textbox(label="Processing Log / Status", lines=6, max_lines=8, interactive=False)
+                # Normal video output preview group (visible by default)
+                with gr.Group(elem_id="video-preview-group") as video_preview_group:
+                    live_frame_output = gr.Image(label="Live Feed / Calibration Line Preview", type="numpy", interactive=False)
+                    video_output = gr.Video(label="Final Processed Video (H.264 Playback)", visible=False)
+                    video_log_output = gr.Textbox(label="Processing Log / Status", lines=6, max_lines=8, interactive=False)
+
+                # Video Calibrator Canvas group (hidden by default, always in DOM)
+                with gr.Group(elem_id="video-calibrator-group") as video_calibrator_group:
+                    # Hidden communication elements
+                    video_calib_image_src = gr.Textbox(elem_id="vid-calib-image-src", elem_classes=["hidden-textbox"], value="")
+                    video_calib_json_input = gr.Textbox(elem_id="vid-calib-json-input", elem_classes=["hidden-textbox"], value=load_initial_calib_json())
+                    vid_calibrator_html = gr.HTML(value=get_calibrator_html_code("vid"))
+                    vid_calib_slider = gr.Slider(minimum=0.0, maximum=10.0, step=0.1, value=0.0, label="Select Reference Frame (Seconds)")
+                    with gr.Row():
+                        save_vid_calib_btn = gr.Button("💾 Save Calibration", variant="primary")
+                        close_vid_calib_btn = gr.Button("❌ Close Calibration Panel", variant="secondary")
+                    vid_save_status = gr.HTML(value="")
                 
         with gr.Row():
             video_violations_df = gr.Dataframe(
@@ -1176,23 +1679,53 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), 
         outputs=[live_frame_output, video_output]
     )
 
-    # Bind calibration tab upload events
-    calib_image_input.change(
-        fn=handle_calib_image_upload,
-        inputs=calib_image_input,
-        outputs=calib_image_src
+    # Image Calibration trigger and save (uses client-side JS toggle)
+    setup_calib_img_btn.click(
+        fn=toggle_image_calibration,
+        inputs=[image_input],
+        outputs=[image_calib_image_src],
+        js="() => { document.body.classList.add('image-calib-active'); }"
     )
-    calib_video_input.change(
-        fn=handle_calib_video_upload,
-        inputs=calib_video_input,
-        outputs=calib_image_src
+    close_img_calib_btn.click(
+        fn=None,
+        inputs=[],
+        outputs=[],
+        js="() => { document.body.classList.remove('image-calib-active'); }"
     )
-    
-    # Bind calibration JSON sync event
-    calib_json_input.change(
-        fn=on_calib_json_change,
-        inputs=calib_json_input,
-        outputs=calibration_status
+    save_img_calib_btn.click(
+        fn=on_save_click_b64,
+        inputs=[image_calib_json_input],
+        outputs=[img_save_status, calibration_status]
+    )
+
+    # Video Calibration trigger, slider release, and save (uses client-side JS toggle)
+    setup_calib_vid_btn.click(
+        fn=toggle_video_calibration,
+        inputs=[video_input, video_calib_timestamp],
+        outputs=[vid_calib_slider, video_calib_image_src],
+        js="() => { const videoEl = document.querySelector('#video-input video'); const tsInput = document.querySelector('#video-calib-timestamp textarea, #video-calib-timestamp input'); if (videoEl && tsInput) { tsInput.value = videoEl.currentTime.toString(); tsInput.dispatchEvent(new Event('input', { bubbles: true })); } document.body.classList.add('video-calib-active'); }"
+    )
+    video_calib_timestamp.change(
+        fn=handle_timestamp_change,
+        inputs=[video_input, video_calib_timestamp],
+        outputs=[video_calib_image_src, vid_calib_slider]
+    )
+    close_vid_calib_btn.click(
+        fn=None,
+        inputs=[],
+        outputs=[],
+        js="() => { document.body.classList.remove('video-calib-active'); }"
+    )
+    vid_calib_slider.release(
+        fn=None,
+        inputs=[vid_calib_slider],
+        outputs=[],
+        js="(slider_val) => { const videoEl = document.querySelector('#video-input video'); if (videoEl) { videoEl.currentTime = parseFloat(slider_val); } }"
+    )
+    save_vid_calib_btn.click(
+        fn=on_save_click_b64,
+        inputs=[video_calib_json_input],
+        outputs=[vid_save_status, calibration_status]
     )
 
     # Bind the image analyze button
@@ -1206,8 +1739,31 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), 
     video_process_btn.click(
         fn=process_traffic_video,
         inputs=[video_input, video_helmet_dropdown, use_custom_line_video, direction_video],
-        outputs=[video_log_output, video_output, video_violations_output, video_violations_df, history_table, live_frame_output]
+        outputs=[video_log_output, video_output, video_violations_output, video_violations_df, history_table, live_frame_output, video_calib_image_src]
     )
+
+    # Script execution enabler for dynamically inserted HTML
+    observer_js = """
+    () => {
+        const evaluateScripts = () => {
+            document.querySelectorAll(".img-calib-container script, .vid-calib-container script").forEach((script) => {
+                if (!script.dataset.evaluated) {
+                    script.dataset.evaluated = "true";
+                    const newScript = document.createElement("script");
+                    newScript.textContent = script.textContent;
+                    newScript.dataset.evaluated = "true";
+                    document.head.appendChild(newScript);
+                }
+            });
+        };
+        // Run once immediately for already rendered elements
+        evaluateScripts();
+        // Observe for any dynamically added elements
+        const observer = new MutationObserver(evaluateScripts);
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+    """
+    demo.load(fn=None, inputs=None, outputs=None, js=observer_js)
     
     gr.Markdown(
         """
@@ -1219,4 +1775,4 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), 
 if __name__ == "__main__":
     fixed_port = 61634
     print(f"[*] Starting Gradio server on fixed port: {fixed_port}")
-    demo.queue().launch(server_name="127.0.0.1", server_port=fixed_port, share=False)
+    demo.queue().launch(server_name="127.0.0.1", server_port=fixed_port, theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), css=css, share=False)
