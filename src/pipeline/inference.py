@@ -572,6 +572,9 @@ class TrafficViolationPipeline:
         detections = []
         violations = []
         
+        # Run Global Model first so we can use it to localize traffic lights and optimize the overall inference pipeline
+        global_results = self.global_model(img, verbose=False)[0]
+        
         has_calib = use_calibration and self.calibration is not None and "zones" in self.calibration
         signal_roi_pts = self.calibration["zones"].get("signal_roi", []) if has_calib else []
         use_signal_roi = len(signal_roi_pts) >= 2
@@ -595,6 +598,7 @@ class TrafficViolationPipeline:
         else:
             tl_img = img
         
+        # Stage 1: Custom Traffic Light Model direct execution
         try:
             tl_preds = self.traffic_light_model(tl_img, verbose=False)[0]
             for box in tl_preds.boxes:
@@ -619,7 +623,7 @@ class TrafficViolationPipeline:
                 elif cls_id == 1 or "off" in cls_name:
                     color_detected = "off"
 
-                if conf >= 0.35 and color_detected != "unknown":
+                if conf >= 0.25 and color_detected != "unknown":
                     tl_results.append(DetectedLight([tx1, ty1, tx2, ty2], conf, color_detected))
                     detections.append({
                         "type": f"traffic_light_{color_detected}",
@@ -640,6 +644,76 @@ class TrafficViolationPipeline:
                                 cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, tl_color, text_thickness)
         except Exception as e:
             print(f"[-] Traffic Light model prediction failed: {e}")
+
+        # Stage 2: Fallback on Global Model traffic lights (COCO class 9)
+        try:
+            for box in global_results.boxes:
+                cls_id = int(box.cls[0])
+                if cls_id == 9: # COCO traffic light
+                    g_conf = float(box.conf[0])
+                    if g_conf >= 0.25:
+                        gx1, gy1, gx2, gy2 = map(int, box.xyxy[0].tolist())
+                        
+                        # Check overlap with already detected traffic lights
+                        overlapping = False
+                        for tl in tl_results:
+                            if compute_iou([gx1, gy1, gx2, gy2], tl.bbox) > 0.30:
+                                overlapping = True
+                                break
+                        
+                        if not overlapping:
+                            # Crop and pad the traffic light by 80px to provide context for the custom model
+                            pad = 80
+                            cx1 = max(0, gx1 - pad)
+                            cy1 = max(0, gy1 - pad)
+                            cx2 = min(w, gx2 + pad)
+                            cy2 = min(h, gy2 + pad)
+                            
+                            crop_img = img[cy1:cy2, cx1:cx2]
+                            if crop_img.size > 0:
+                                crop_preds = self.traffic_light_model(crop_img, verbose=False)[0]
+                                for c_box in crop_preds.boxes:
+                                    c_cls_id = int(c_box.cls[0])
+                                    c_cls_name = self.traffic_light_model.names.get(c_cls_id, "unknown").lower()
+                                    c_conf = float(c_box.conf[0])
+                                    
+                                    c_color_detected = "unknown"
+                                    if c_cls_id == 0 or "green" in c_cls_name:
+                                        c_color_detected = "green"
+                                    elif c_cls_id == 2 or "red" in c_cls_name:
+                                        c_color_detected = "red"
+                                    elif c_cls_id == 3 or "yellow" in c_cls_name:
+                                        c_color_detected = "yellow"
+                                    elif c_cls_id == 1 or "off" in c_cls_name:
+                                        c_color_detected = "off"
+                                        
+                                    if c_conf >= 0.20 and c_color_detected != "unknown":
+                                        cx1_crop, cy1_crop, cx2_crop, cy2_crop = map(int, c_box.xyxy[0].tolist())
+                                        tx1 = cx1_crop + cx1
+                                        ty1 = cy1_crop + cy1
+                                        tx2 = cx2_crop + cx1
+                                        ty2 = cy2_crop + cy1
+                                        
+                                        tl_results.append(DetectedLight([tx1, ty1, tx2, ty2], c_conf, c_color_detected))
+                                        detections.append({
+                                            "type": f"traffic_light_{c_color_detected}",
+                                            "bbox": [tx1, ty1, tx2, ty2],
+                                            "confidence": c_conf
+                                        })
+                                        
+                                        tl_color = (128, 128, 128)
+                                        if c_color_detected == "red":
+                                            tl_color = (0, 0, 255)
+                                        elif c_color_detected == "yellow":
+                                            tl_color = (0, 255, 255)
+                                        elif c_color_detected == "green":
+                                            tl_color = (0, 255, 0)
+                                        cv2.rectangle(img, (tx1, ty1), (tx2, ty2), tl_color, box_thickness)
+                                        cv2.putText(img, f"TL: {c_color_detected.upper()} ({c_conf*100:.1f}%) [Fallback]", (tx1, max(10, ty1 - 3)),
+                                                    cv2.FONT_HERSHEY_SIMPLEX, h_font_scale, tl_color, text_thickness)
+                                        break
+        except Exception as e:
+            print(f"[-] Global traffic light fallback processing failed: {e}")
 
         if tl_results:
             best_tl = max(tl_results, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
@@ -670,8 +744,9 @@ class TrafficViolationPipeline:
             pole_x = None
             is_physical = True
 
-        # Step 1: Run Global Bounding Box Detection
-        global_results = self.global_model(img, verbose=False)[0]
+        # Step 1: Run Global Bounding Box Detection (uses cached results from Step 0)
+        # global_results is already populated above
+
         
         # Extract persons and cell phones from the global model results
         persons = []
