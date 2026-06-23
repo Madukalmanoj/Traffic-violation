@@ -16,6 +16,78 @@ os.makedirs("data/processed", exist_ok=True)
 # Historical violation log
 history_list = []
 
+def get_analytics():
+    if not history_list:
+        df_dist = pd.DataFrame([
+            {"Violation Type": "Helmet Non-Compliance", "Count": 0},
+            {"Violation Type": "Triple Riding", "Count": 0},
+            {"Violation Type": "No Seatbelt", "Count": 0},
+            {"Violation Type": "Using Mobile", "Count": 0},
+            {"Violation Type": "Red Light Violation", "Count": 0},
+            {"Violation Type": "Stop Line Violation", "Count": 0}
+        ])
+        df_time = pd.DataFrame(columns=["Time", "Count"])
+        metrics_html = """
+        <div style="display: flex; gap: 20px; margin-bottom: 20px;">
+            <div style="flex: 1; background: #111827; border: 1px solid #374151; padding: 20px; border-radius: 12px; text-align: center; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+                <div style="color: #9CA3AF; font-size: 14px; margin-bottom: 5px; font-weight: 500; text-transform: uppercase;">Total Violations</div>
+                <div style="color: #EF4444; font-size: 36px; font-weight: bold;">0</div>
+            </div>
+            <div style="flex: 1; background: #111827; border: 1px solid #374151; padding: 20px; border-radius: 12px; text-align: center; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+                <div style="color: #9CA3AF; font-size: 14px; margin-bottom: 5px; font-weight: 500; text-transform: uppercase;">Most Common Violation</div>
+                <div style="color: #10B981; font-size: 20px; font-weight: bold; margin-top: 10px;">N/A</div>
+            </div>
+            <div style="flex: 1; background: #111827; border: 1px solid #374151; padding: 20px; border-radius: 12px; text-align: center; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+                <div style="color: #9CA3AF; font-size: 14px; margin-bottom: 5px; font-weight: 500; text-transform: uppercase;">Latest Log Entry</div>
+                <div style="color: #60A5FA; font-size: 16px; font-weight: 500; margin-top: 15px;">No active log</div>
+            </div>
+        </div>
+        """
+        return metrics_html, df_dist, df_time
+
+    df_history = pd.DataFrame(history_list)
+    total_violations = len(df_history)
+    
+    type_counts = df_history["Violation Type"].value_counts().to_dict()
+    all_types = ["Helmet Non-Compliance", "Triple Riding", "No Seatbelt", "Using Mobile", "Red Light Violation", "Stop Line Violation"]
+    dist_data = []
+    for t in all_types:
+        dist_data.append({"Violation Type": t, "Count": type_counts.get(t, 0)})
+    df_dist = pd.DataFrame(dist_data)
+    
+    most_common = df_history["Violation Type"].mode()[0] if not df_history.empty else "N/A"
+    most_common_count = type_counts.get(most_common, 0)
+    most_common_str = f"{most_common} ({most_common_count})" if most_common != "N/A" else "N/A"
+    
+    latest_entry = df_history.iloc[-1]
+    latest_str = f"{latest_entry['Violation Type']} | Plate: {latest_entry['License Plate']}"
+    
+    try:
+        df_history["Time"] = pd.to_datetime(df_history["Timestamp"]).dt.strftime("%Y-%m-%d %H:%M")
+        time_counts = df_history.groupby("Time").size().reset_index(name="Count")
+        df_time = time_counts.sort_values("Time")
+    except Exception:
+        df_time = pd.DataFrame(columns=["Time", "Count"])
+    
+    metrics_html = f"""
+    <div style="display: flex; gap: 20px; margin-bottom: 20px;">
+        <div style="flex: 1; background: #111827; border: 1px solid #374151; padding: 20px; border-radius: 12px; text-align: center; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+            <div style="color: #9CA3AF; font-size: 14px; margin-bottom: 5px; font-weight: 500; text-transform: uppercase;">Total Violations</div>
+            <div style="color: #EF4444; font-size: 36px; font-weight: bold;">{total_violations}</div>
+        </div>
+        <div style="flex: 1; background: #111827; border: 1px solid #374151; padding: 20px; border-radius: 12px; text-align: center; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+            <div style="color: #9CA3AF; font-size: 14px; margin-bottom: 5px; font-weight: 500; text-transform: uppercase;">Most Common Violation</div>
+            <div style="color: #10B981; font-size: 18px; font-weight: bold; margin-top: 10px;">{most_common_str}</div>
+        </div>
+        <div style="flex: 1; background: #111827; border: 1px solid #374151; padding: 20px; border-radius: 12px; text-align: center; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+            <div style="color: #9CA3AF; font-size: 14px; margin-bottom: 5px; font-weight: 500; text-transform: uppercase;">Latest Log Entry</div>
+            <div style="color: #60A5FA; font-size: 14px; font-weight: 500; margin-top: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="{latest_str}">{latest_str}</div>
+        </div>
+    </div>
+    """
+    
+    return metrics_html, df_dist, df_time
+
 # Video frame caching to make live slider dragging extremely fast and smooth
 VIDEO_FRAME_CACHE = {}
 
@@ -1365,25 +1437,31 @@ def process_traffic_image(image, helmet_model_type, use_custom_line, direction_s
             
         history_df = pd.DataFrame(history_list) if history_list else pd.DataFrame(columns=["Timestamp", "Violation Type", "Details", "License Plate"])
         
-        return annotated_rgb, signal_status_str, violations_json, history_df
+        metrics_html, df_dist, df_time = get_analytics()
+        return annotated_rgb, signal_status_str, violations_json, history_df, metrics_html, df_dist, df_time
         
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return None, f"Error: {str(e)}", "[]", pd.DataFrame(history_list) if history_list else pd.DataFrame(columns=["Timestamp", "Violation Type", "Details", "License Plate"])
+        metrics_html, df_dist, df_time = get_analytics()
+        return None, f"Error: {str(e)}", "[]", (pd.DataFrame(history_list) if history_list else pd.DataFrame(columns=["Timestamp", "Violation Type", "Details", "License Plate"])), metrics_html, df_dist, df_time
 
 def process_traffic_video(video_path, helmet_model_type, use_custom_line, direction_str):
     empty_df = pd.DataFrame(columns=["Timestamp", "Violation Type", "Details", "License Plate"])
     
     if video_path is None:
+        metrics_html, df_dist, df_time = get_analytics()
         yield (
             "Error: No video uploaded.",
             gr.update(visible=False),
             "[]",
             empty_df,
-            pd.DataFrame(history_list) if history_list else empty_df,
+            (pd.DataFrame(history_list) if history_list else empty_df),
             gr.update(visible=False),
-            gr.update()
+            gr.update(),
+            metrics_html,
+            df_dist,
+            df_time
         )
         return
         
@@ -1400,7 +1478,8 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
     logs = ["[*] Starting video analysis pipeline..."]
     global_df = pd.DataFrame(history_list) if history_list else empty_df
     
-    yield "\n".join(logs), gr.update(visible=False), "[]", empty_df, global_df, gr.update(visible=False), gr.update()
+    metrics_html, df_dist, df_time = get_analytics()
+    yield "\n".join(logs), gr.update(visible=False), "[]", empty_df, global_df, gr.update(visible=False), gr.update(), metrics_html, df_dist, df_time
     
     try:
         direction = "away" if "away" in direction_str.lower() else "towards"
@@ -1438,7 +1517,8 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
             # Convert live frame to base64 to stream to the canvas
             b64_frame = get_base64_from_file(live_frame)
             
-            yield visible_logs, gr.update(visible=False), json.dumps(val, indent=2), current_df, global_df, gr.update(value=live_frame, visible=True), b64_frame
+            metrics_html, df_dist, df_time = get_analytics()
+            yield visible_logs, gr.update(visible=False), json.dumps(val, indent=2), current_df, global_df, gr.update(value=live_frame, visible=True), b64_frame, metrics_html, df_dist, df_time
             
         # Final yield
         final_violations = final_res["violations"]
@@ -1467,20 +1547,25 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
         logs.append(f"[+] Output saved to: {final_res['processed_video']}")
         visible_logs = "\n".join(logs[-15:])
         
-        yield visible_logs, gr.update(value=final_res["processed_video"], visible=True), json.dumps(final_violations, indent=2), final_df, updated_global_df, gr.update(value=None, visible=True), gr.update()
+        metrics_html, df_dist, df_time = get_analytics()
+        yield visible_logs, gr.update(value=final_res["processed_video"], visible=True), json.dumps(final_violations, indent=2), final_df, updated_global_df, gr.update(value=None, visible=True), gr.update(), metrics_html, df_dist, df_time
         
     except Exception as e:
         import traceback
         traceback.print_exc()
         logs.append(f"[-] Error: {str(e)}")
+        metrics_html, df_dist, df_time = get_analytics()
         yield (
             "\n".join(logs[-15:]),
             gr.update(visible=False),
             "[]",
             empty_df,
-            pd.DataFrame(history_list) if history_list else empty_df,
+            (pd.DataFrame(history_list) if history_list else empty_df),
             gr.update(visible=False),
-            gr.update()
+            gr.update(),
+            metrics_html,
+            df_dist,
+            df_time
         )
 
 
@@ -1664,6 +1749,36 @@ with gr.Blocks() as demo:
             label="All Logged Enforcement Violations",
             interactive=False
         )
+
+    with gr.Tab("Analytics Dashboard"):
+        with gr.Column():
+            gr.Markdown("### 📊 Real-Time Violation Analytics & Insights")
+            analytics_metrics = gr.HTML(value=get_analytics()[0], elem_id="analytics-metrics-panel")
+            
+            with gr.Row():
+                analytics_bar = gr.BarPlot(
+                    value=get_analytics()[1],
+                    x="Violation Type",
+                    y="Count",
+                    title="Violation Category Distribution",
+                    tooltip=["Violation Type", "Count"],
+                    y_title="Number of Violations",
+                    x_title="Violation Category",
+                    color="Violation Type",
+                    height=350
+                )
+                
+                analytics_line = gr.LinePlot(
+                    value=get_analytics()[2],
+                    x="Time",
+                    y="Count",
+                    title="Violation Trend Over Time",
+                    tooltip=["Time", "Count"],
+                    y_title="Violations Count",
+                    x_title="Enforcement Timestamp (Minute)",
+                    color_legend_position="none",
+                    height=350
+                )
  
     # Bind preview updates for Image tab
     image_input.change(
@@ -1752,14 +1867,14 @@ with gr.Blocks() as demo:
     process_btn.click(
         fn=process_traffic_image,
         inputs=[image_input, helmet_model_dropdown, use_custom_line_image, direction_image],
-        outputs=[image_output, signal_status_output, violations_output, history_table]
+        outputs=[image_output, signal_status_output, violations_output, history_table, analytics_metrics, analytics_bar, analytics_line]
     )
     
     # Bind the video analyze button
     video_process_btn.click(
         fn=process_traffic_video,
         inputs=[video_input, video_helmet_dropdown, use_custom_line_video, direction_video],
-        outputs=[video_log_output, video_output, video_violations_output, video_violations_df, history_table, live_frame_output, video_calib_image_src]
+        outputs=[video_log_output, video_output, video_violations_output, video_violations_df, history_table, live_frame_output, video_calib_image_src, analytics_metrics, analytics_bar, analytics_line]
     )
 
     # Script execution enabler for dynamically inserted HTML
