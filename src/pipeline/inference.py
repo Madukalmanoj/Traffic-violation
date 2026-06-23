@@ -271,7 +271,13 @@ class TrafficViolationPipeline:
         self.global_model = YOLO("yolov8n.pt")
         
         # Load custom Helmet Detector
-        helmet_path = os.path.join(weights_dir, "helmet_yolov8.pt")
+        default_helmet_path = os.path.join(weights_dir, "helmet_yolov8.pt")
+        custom_helmet_path = r"D:\Hackathons\flipkartTraffic\models\helmet_detector.pt"
+        if os.path.exists(custom_helmet_path):
+            helmet_path = custom_helmet_path
+            print(f"[*] Custom helmet model detected at {custom_helmet_path}. Using it for testing.")
+        else:
+            helmet_path = default_helmet_path
         print(f"[*] Loading Helmet Model from {helmet_path}...")
         self.helmet_model = YOLO(helmet_path)
         
@@ -1389,8 +1395,8 @@ class TrafficViolationPipeline:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        # Calculate stride based on total frames (minimum 5, maximum 10)
-        stride = max(5, min(10, total_frames // 100))
+        # Calculate stride based on total frames (minimum 3, maximum 5)
+        stride = max(3, min(5, total_frames // 100))
         print(f"[*] Calculated video processing stride: {stride} (Total frames: {total_frames})")
         
         base_name = os.path.splitext(os.path.basename(video_path))[0]

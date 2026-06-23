@@ -1307,7 +1307,11 @@ def process_traffic_image(image, helmet_model_type, use_custom_line, direction_s
     if "jarvanlee" in helmet_model_type:
         pipeline.helmet_model = YOLO("weights/motorcycle_helmet_yolov8.pt")
     else:
-        pipeline.helmet_model = YOLO("weights/helmet_yolov8.pt")
+        custom_helmet_path = r"D:\Hackathons\flipkartTraffic\models\helmet_detector.pt"
+        if os.path.exists(custom_helmet_path):
+            pipeline.helmet_model = YOLO(custom_helmet_path)
+        else:
+            pipeline.helmet_model = YOLO("weights/helmet_yolov8.pt")
         
     # Save the input image temporary for processing
     temp_input_path = os.path.join("data/raw", "temp_upload.jpg")
@@ -1387,7 +1391,11 @@ def process_traffic_video(video_path, helmet_model_type, use_custom_line, direct
     if "jarvanlee" in helmet_model_type:
         pipeline.helmet_model = YOLO("weights/motorcycle_helmet_yolov8.pt")
     else:
-        pipeline.helmet_model = YOLO("weights/helmet_yolov8.pt")
+        custom_helmet_path = r"D:\Hackathons\flipkartTraffic\models\helmet_detector.pt"
+        if os.path.exists(custom_helmet_path):
+            pipeline.helmet_model = YOLO(custom_helmet_path)
+        else:
+            pipeline.helmet_model = YOLO("weights/helmet_yolov8.pt")
         
     logs = ["[*] Starting video analysis pipeline..."]
     global_df = pd.DataFrame(history_list) if history_list else empty_df
@@ -1571,8 +1579,8 @@ with gr.Blocks() as demo:
                 image_input = gr.Image(type="numpy", label="Upload Traffic Photo")
                 with gr.Group():
                     helmet_model_dropdown = gr.Dropdown(
-                        choices=["iam-tsr (YOLOv8-Nano)", "jarvanlee (YOLOv8-Medium)"],
-                        value="iam-tsr (YOLOv8-Nano)",
+                        choices=["Custom flipkartTraffic (YOLOv8-Medium)", "jarvanlee (YOLOv8-Medium)"],
+                        value="Custom flipkartTraffic (YOLOv8-Medium)",
                         label="Helmet Detection Model"
                     )
                     use_custom_line_image = gr.Checkbox(label="Use Custom Stop Zone Calibration", value=True)
@@ -1609,8 +1617,8 @@ with gr.Blocks() as demo:
                 video_calib_timestamp = gr.Textbox(elem_id="video-calib-timestamp", elem_classes=["hidden-textbox"], value="0.0")
                 with gr.Group():
                     video_helmet_dropdown = gr.Dropdown(
-                        choices=["iam-tsr (YOLOv8-Nano)", "jarvanlee (YOLOv8-Medium)"],
-                        value="iam-tsr (YOLOv8-Nano)",
+                        choices=["Custom flipkartTraffic (YOLOv8-Medium)", "jarvanlee (YOLOv8-Medium)"],
+                        value="Custom flipkartTraffic (YOLOv8-Medium)",
                         label="Helmet Detection Model"
                     )
                     use_custom_line_video = gr.Checkbox(label="Use Custom Stop Zone Calibration", value=True)
