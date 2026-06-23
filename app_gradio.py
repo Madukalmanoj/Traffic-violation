@@ -1776,7 +1776,6 @@ with gr.Blocks() as demo:
                     tooltip=["Time", "Count"],
                     y_title="Violations Count",
                     x_title="Enforcement Timestamp (Minute)",
-                    color_legend_position="none",
                     height=350
                 )
  
@@ -1900,12 +1899,7 @@ with gr.Blocks() as demo:
     """
     demo.load(fn=None, inputs=None, outputs=None, js=observer_js)
     
-    gr.Markdown(
-        """
-        ---
-        **Hackathon Deployment Tip:** To generate a public shareable URL for judges, run this script with `demo.queue().launch(share=True)`.
-        """
-    )
+
 
 if __name__ == "__main__":
     fixed_port = 61634
