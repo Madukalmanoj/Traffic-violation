@@ -17,7 +17,8 @@ def point_in_zone(point, polygon_points):
     if not polygon_points or len(polygon_points) < 3:
         return False
     poly = np.array(polygon_points, dtype=np.int32)
-    return cv2.pointPolygonTest(poly, point, False) >= 0
+    pt = (float(point[0]), float(point[1]))
+    return cv2.pointPolygonTest(poly, pt, False) >= 0
 
 class DetectedLight:
     def __init__(self, bbox, confidence, state):
@@ -288,7 +289,13 @@ class TrafficViolationPipeline:
         self.plate_model = YOLO(plate_path)
 
         # Load custom Traffic Light Detector
-        traffic_light_path = os.path.join(weights_dir, "traffic_light_yolov8.pt")
+        default_traffic_light_path = os.path.join(weights_dir, "traffic_light_yolov8.pt")
+        custom_traffic_light_path = r"D:\Hackathons\flipkartTraffic\models\traffic_light_detector.pt"
+        if os.path.exists(custom_traffic_light_path):
+            traffic_light_path = custom_traffic_light_path
+            print(f"[*] Custom traffic light model detected at {custom_traffic_light_path}. Using it for testing.")
+        else:
+            traffic_light_path = default_traffic_light_path
         print(f"[*] Loading Traffic Light Model from {traffic_light_path}...")
         self.traffic_light_model = YOLO(traffic_light_path)
         
@@ -656,7 +663,10 @@ class TrafficViolationPipeline:
             is_physical = False
         else:
             # Auto detect zebra crossing zone bounding box
-            x_min, y_min, x_max, y_max = self.detect_zebra_crossing_box(img)
+            if len(tl_results) > 0:
+                x_min, y_min, x_max, y_max = self.detect_zebra_crossing_box(img)
+            else:
+                x_min, y_min, x_max, y_max = 0, 0, 0, 0
             pole_x = None
             is_physical = True
 
@@ -766,7 +776,7 @@ class TrafficViolationPipeline:
                 tr_info = tracked_vehicles.get(tuple(xyxy.tolist())) if tracker is not None else None
                 if tracker is not None:
                     if tr_info:
-                        if tr_info["red_light_violation"]:
+                        if tr_info["red_light_violation"] and len(tl_results) > 0:
                             is_red_light_violation = True
                             is_moto_violation = True
                             moto_violations.append("RED LIGHT VIOLATION")
@@ -775,7 +785,8 @@ class TrafficViolationPipeline:
                                 "bbox": [int(x1), int(y1), int(x2), int(y2)],
                                 "details": f"Motorcycle (Track ID: {tr_info['track_id']}) crossed exit line during RED signal"
                             })
-                        elif tr_info["stop_line_violation"]:
+                        elif tr_info["stop_line_violation"] and len(tl_results) > 0:
+                            is_stop_line_violation = True
                             is_moto_violation = True
                             moto_violations.append("STOP LINE VIOLATION")
                             violations.append({
@@ -784,7 +795,7 @@ class TrafficViolationPipeline:
                                 "details": f"Motorcycle (Track ID: {tr_info['track_id']}) crossed stop line during RED signal"
                             })
                 else:
-                    if intersection_state == "red":
+                    if intersection_state == "red" and len(tl_results) > 0:
                         moto_center_x = (x1 + x2) // 2
                         ref_pt = (moto_center_x, y2)
                         
@@ -829,6 +840,7 @@ class TrafficViolationPipeline:
                                 "details": f"Motorcycle crossed exit line zone during RED signal"
                             })
                         elif is_stop_line_viol:
+                            is_stop_line_violation = True
                             is_moto_violation = True
                             moto_violations.append("STOP LINE VIOLATION")
                             violations.append({
@@ -837,6 +849,10 @@ class TrafficViolationPipeline:
                                 "details": f"Motorcycle crossed stop line zone during RED signal"
                             })
                 
+                # User constraint: if exactly 2 riders, and one is wearing a helmet and one is not, it is not a violation.
+                if riders_count == 2 and no_helmet_count == 1:
+                    no_helmet_count = 0
+                    
                 if no_helmet_count > 0:
                     is_moto_violation = True
                     moto_violations.append("NO HELMET")
@@ -949,14 +965,14 @@ class TrafficViolationPipeline:
                 tr_info = tracked_vehicles.get(tuple(xyxy.tolist())) if tracker is not None else None
                 if tracker is not None:
                     if tr_info:
-                        if tr_info["red_light_violation"]:
+                        if tr_info["red_light_violation"] and len(tl_results) > 0:
                             is_red_light_violation = True
                             violations.append({
                                 "type": "Red Light Violation",
                                 "bbox": [int(x1), int(y1), int(x2), int(y2)],
                                 "details": f"Vehicle (Track ID: {tr_info['track_id']}) crossed exit line during RED signal"
                             })
-                        elif tr_info["stop_line_violation"]:
+                        elif tr_info["stop_line_violation"] and len(tl_results) > 0:
                             is_stop_line_violation = True
                             violations.append({
                                 "type": "Stop Line Violation",
@@ -964,7 +980,7 @@ class TrafficViolationPipeline:
                                 "details": f"Vehicle (Track ID: {tr_info['track_id']}) crossed stop line during RED signal"
                             })
                 else:
-                    if intersection_state == "red":
+                    if intersection_state == "red" and len(tl_results) > 0:
                         veh_center_x = (x1 + x2) // 2
                         ref_pt = (veh_center_x, y2)
                         
