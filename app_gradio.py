@@ -1783,4 +1783,4 @@ with gr.Blocks() as demo:
 if __name__ == "__main__":
     fixed_port = 61634
     print(f"[*] Starting Gradio server on fixed port: {fixed_port}")
-    demo.queue().launch(server_name="127.0.0.1", server_port=fixed_port, theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), css=css, share=False)
+    demo.queue().launch(server_name="0.0.0.0", server_port=fixed_port, theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), css=css, share=True)
